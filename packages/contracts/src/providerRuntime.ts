@@ -162,6 +162,7 @@ const ProviderRuntimeEventType = Schema.Literals([
   "turn.completed",
   "turn.aborted",
   "turn.plan.updated",
+  "turn.queue.updated",
   "turn.proposed.delta",
   "turn.proposed.completed",
   "turn.diff.updated",
@@ -212,6 +213,7 @@ const TurnStartedType = Schema.Literal("turn.started");
 const TurnCompletedType = Schema.Literal("turn.completed");
 const TurnAbortedType = Schema.Literal("turn.aborted");
 const TurnPlanUpdatedType = Schema.Literal("turn.plan.updated");
+const TurnQueueUpdatedType = Schema.Literal("turn.queue.updated");
 const TurnProposedDeltaType = Schema.Literal("turn.proposed.delta");
 const TurnProposedCompletedType = Schema.Literal("turn.proposed.completed");
 const TurnDiffUpdatedType = Schema.Literal("turn.diff.updated");
@@ -379,6 +381,25 @@ const TurnPlanUpdatedPayload = Schema.Struct({
   plan: Schema.Array(RuntimePlanStep),
 });
 export type TurnPlanUpdatedPayload = typeof TurnPlanUpdatedPayload.Type;
+
+/**
+ * Snapshot of a provider's queued messages for the in-flight turn. Pi emits
+ * this as a `queue_update` notification whenever `steer` or `follow_up`
+ * changes the pending-message list (see pi-mono `packages/coding-agent/
+ * docs/rpc.md` §queue_update).
+ *
+ * - `steering`: messages that should nudge the in-flight turn before the
+ *   next model call.
+ * - `followUp`: messages to feed into the next turn after this one
+ *   completes.
+ *
+ * Both lists are ordered by receipt (oldest first).
+ */
+const TurnQueueUpdatedPayload = Schema.Struct({
+  steering: Schema.Array(Schema.String),
+  followUp: Schema.Array(Schema.String),
+});
+export type TurnQueueUpdatedPayload = typeof TurnQueueUpdatedPayload.Type;
 
 const TurnProposedDeltaPayload = Schema.Struct({
   delta: Schema.String,
@@ -726,6 +747,14 @@ const ProviderRuntimeTurnPlanUpdatedEvent = Schema.Struct({
 });
 export type ProviderRuntimeTurnPlanUpdatedEvent = typeof ProviderRuntimeTurnPlanUpdatedEvent.Type;
 
+const ProviderRuntimeTurnQueueUpdatedEvent = Schema.Struct({
+  ...ProviderRuntimeEventBase.fields,
+  type: TurnQueueUpdatedType,
+  payload: TurnQueueUpdatedPayload,
+});
+export type ProviderRuntimeTurnQueueUpdatedEvent =
+  typeof ProviderRuntimeTurnQueueUpdatedEvent.Type;
+
 const ProviderRuntimeTurnProposedDeltaEvent = Schema.Struct({
   ...ProviderRuntimeEventBase.fields,
   type: TurnProposedDeltaType,
@@ -961,6 +990,7 @@ export const ProviderRuntimeEventV2 = Schema.Union([
   ProviderRuntimeTurnCompletedEvent,
   ProviderRuntimeTurnAbortedEvent,
   ProviderRuntimeTurnPlanUpdatedEvent,
+  ProviderRuntimeTurnQueueUpdatedEvent,
   ProviderRuntimeTurnProposedDeltaEvent,
   ProviderRuntimeTurnProposedCompletedEvent,
   ProviderRuntimeTurnDiffUpdatedEvent,

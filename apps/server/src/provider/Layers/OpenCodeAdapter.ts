@@ -1317,6 +1317,15 @@ export function makeOpenCodeAdapterLive(_options?: OpenCodeAdapterLiveOptions) {
             }),
         });
 
+      const queueMessage: OpenCodeAdapterShape["queueMessage"] = () =>
+        Effect.fail(
+          new ProviderAdapterRequestError({
+            provider: PROVIDER,
+            method: "queueMessage",
+            detail: "OpenCode does not support message queueing.",
+          }),
+        );
+
       return {
         provider: PROVIDER,
         capabilities: {
@@ -1325,6 +1334,7 @@ export function makeOpenCodeAdapterLive(_options?: OpenCodeAdapterLiveOptions) {
         startSession,
         sendTurn,
         interruptTurn,
+        queueMessage,
         respondToRequest,
         respondToUserInput,
         stopSession,

@@ -1031,12 +1031,22 @@ function makeCursorAdapter(options?: CursorAdapterLiveOptions) {
 
     const streamEvents = Stream.fromPubSub(runtimeEventPubSub);
 
+    const queueMessage: CursorAdapterShape["queueMessage"] = () =>
+      Effect.fail(
+        new ProviderAdapterRequestError({
+          provider: PROVIDER,
+          method: "queueMessage",
+          detail: "Cursor does not support message queueing.",
+        }),
+      );
+
     return {
       provider: PROVIDER,
       capabilities: { sessionModelSwitch: "in-session" },
       startSession,
       sendTurn,
       interruptTurn,
+      queueMessage,
       readThread,
       rollbackThread,
       respondToRequest,

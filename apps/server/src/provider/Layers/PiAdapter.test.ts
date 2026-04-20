@@ -61,9 +61,53 @@ class FakeWritable extends EventEmitter {
 class FakeRpcChildProcess extends EventEmitter {
   readonly stdout = new FakeReadable();
   readonly stderr = new FakeReadable();
-  readonly stdin = new FakeWritable();
+  readonly stdin: FakeWritable;
   killed = false;
   exitCode: number | null = null;
+  /** Canned get_state response — individual tests can mutate via configureState. */
+  private stateResponse: {
+    readonly sessionId?: string;
+    readonly sessionFile?: string;
+    readonly isStreaming?: boolean;
+  } = { isStreaming: false };
+
+  constructor() {
+    super();
+    this.stdin = new FakeWritable();
+    // Intercept writes so we can auto-respond to bootstrap frames (get_state)
+    // without every test having to drive that handshake. Individual tests
+    // still observe the frame via writtenFrames().
+    const originalWrite = this.stdin.write.bind(this.stdin);
+    this.stdin.write = (chunk: string | Uint8Array) => {
+      const result = originalWrite(chunk);
+      const text = typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
+      for (const line of text.split("\n")) {
+        if (line.trim().length === 0) continue;
+        try {
+          const frame = JSON.parse(line) as { type?: string; id?: string };
+          if (frame.type === "get_state" && typeof frame.id === "string") {
+            setImmediate(() =>
+              this.stdout.emit(
+                "data",
+                `${JSON.stringify({ type: "response", command: "get_state", id: frame.id, success: true, data: this.stateResponse })}\n`,
+              ),
+            );
+          }
+        } catch {
+          // ignore — tests may write malformed frames intentionally
+        }
+      }
+      return result;
+    };
+  }
+
+  configureState(state: {
+    readonly sessionId?: string;
+    readonly sessionFile?: string;
+    readonly isStreaming?: boolean;
+  }): void {
+    this.stateResponse = state;
+  }
 
   kill(_signal?: NodeJS.Signals): boolean {
     this.killed = true;
@@ -1220,6 +1264,346 @@ describe("PiAdapterLive", () => {
             "openai-codex/gpt-5.4",
             "session.model should stay pinned to the pi-active model when switch is skipped",
           );
+        }).pipe(Effect.provide(makeTestLayer("rpc"))),
+      );
+    });
+
+    it("queueMessage(steer) writes a steer frame while a turn is in flight", async () => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const { rpcChildren } = installRpcSpawnMock();
+          const adapter = yield* PiAdapter;
+          const threadId = asThreadId("thread-pi-rpc-steer");
+
+          yield* adapter.startSession({
+            provider: "pi",
+            threadId,
+            runtimeMode: "full-access",
+          });
+          yield* Effect.sleep(10);
+          const child = rpcChildren[0]!;
+
+          // Start a turn and leave it in flight.
+          const turnPromise = Effect.runPromise(
+            adapter.sendTurn({ threadId, input: "run" }).pipe(Effect.provide(makeTestLayer("rpc"))),
+          );
+          yield* Effect.sleep(10);
+          const promptFrame = child.writtenFrames().find((f) => f.type === "prompt")!;
+          child.respondTo(promptFrame, { success: true });
+
+          // Now queue a steer mid-turn.
+          const steerPromise = Effect.runPromise(
+            adapter
+              .queueMessage(threadId, "steer", { threadId, input: "focus on errors" })
+              .pipe(Effect.provide(makeTestLayer("rpc"))),
+          );
+          yield* Effect.sleep(10);
+          const steerFrame = child.writtenFrames().find((f) => f.type === "steer")!;
+          assert.ok(steerFrame, "steer frame should be written");
+          assert.equal(steerFrame.message, "focus on errors");
+          child.respondTo(steerFrame, { success: true });
+          yield* Effect.promise(() => steerPromise);
+
+          // And a follow-up.
+          const followPromise = Effect.runPromise(
+            adapter
+              .queueMessage(threadId, "followUp", { threadId, input: "then summarize" })
+              .pipe(Effect.provide(makeTestLayer("rpc"))),
+          );
+          yield* Effect.sleep(10);
+          const followFrame = child.writtenFrames().find((f) => f.type === "follow_up")!;
+          assert.ok(followFrame, "follow_up frame should be written");
+          assert.equal(followFrame.message, "then summarize");
+          child.respondTo(followFrame, { success: true });
+          yield* Effect.promise(() => followPromise);
+
+          // Settle the turn so fibers drain.
+          child.notify({
+            type: "turn_end",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "done" }],
+              stopReason: "stop",
+            },
+          });
+          yield* Effect.promise(() => turnPromise);
+        }).pipe(Effect.provide(makeTestLayer("rpc"))),
+      );
+    });
+
+    it("maps pi queue_update notifications to turn.queue.updated events", async () => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const { rpcChildren } = installRpcSpawnMock();
+          const adapter = yield* PiAdapter;
+          const threadId = asThreadId("thread-pi-rpc-queue-update");
+
+          yield* adapter.startSession({
+            provider: "pi",
+            threadId,
+            runtimeMode: "full-access",
+          });
+          yield* Effect.sleep(10);
+          const child = rpcChildren[0]!;
+
+          // Subscribe before the turn so we capture turn.started + queue events.
+          const eventsFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 3)).pipe(
+            Effect.forkChild,
+          );
+          yield* Effect.sleep(0);
+
+          const turnPromise = Effect.runPromise(
+            adapter.sendTurn({ threadId, input: "long task" }).pipe(Effect.provide(makeTestLayer("rpc"))),
+          );
+          yield* Effect.sleep(10);
+          const promptFrame = child.writtenFrames().find((f) => f.type === "prompt")!;
+          child.respondTo(promptFrame, { success: true });
+
+          child.notify({
+            type: "queue_update",
+            steering: ["focus on errors"],
+            followUp: ["then summarize"],
+          });
+
+          child.notify({
+            type: "turn_end",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "done" }],
+              stopReason: "stop",
+            },
+          });
+          yield* Effect.promise(() => turnPromise);
+
+          const events = yield* joinEvents(eventsFiber);
+          const queueEvent = events.find((e) => e.type === "turn.queue.updated");
+          assert.ok(queueEvent, "expected turn.queue.updated event");
+          if (queueEvent?.type !== "turn.queue.updated") throw new Error();
+          assert.deepEqual(queueEvent.payload.steering, ["focus on errors"]);
+          assert.deepEqual(queueEvent.payload.followUp, ["then summarize"]);
+        }).pipe(Effect.provide(makeTestLayer("rpc"))),
+      );
+    });
+
+    it("queueMessage rejects when no turn is active", async () => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          installRpcSpawnMock();
+          const adapter = yield* PiAdapter;
+          const threadId = asThreadId("thread-pi-rpc-queue-no-turn");
+
+          yield* adapter.startSession({
+            provider: "pi",
+            threadId,
+            runtimeMode: "full-access",
+          });
+          yield* Effect.sleep(10);
+
+          const attempt = yield* adapter
+            .queueMessage(threadId, "steer", { threadId, input: "hi" })
+            .pipe(Effect.flip);
+          assert.equal(attempt._tag, "ProviderAdapterValidationError");
+        }).pipe(Effect.provide(makeTestLayer("rpc"))),
+      );
+    });
+
+    it("declares sessionModelSwitch in-session capability", async () => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          installRpcSpawnMock();
+          const adapter = yield* PiAdapter;
+          assert.equal(adapter.capabilities.sessionModelSwitch, "in-session");
+        }).pipe(Effect.provide(makeTestLayer("rpc"))),
+      );
+    });
+
+    it("synthesizes an active turn when pi reports isStreaming on reconnect", async () => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const rpcChildren: FakeRpcChildProcess[] = [];
+          spawnMock.mockReset();
+          spawnMock.mockImplementation((_bin: string, args: string[]) => {
+            if (args.includes("--list-models")) {
+              const catalog = new FakeChildProcess();
+              setImmediate(() => catalog.emit("exit", 0, null));
+              return catalog;
+            }
+            const child = new FakeRpcChildProcess();
+            child.configureState({
+              sessionId: "pi-sess-abcd",
+              sessionFile: "/tmp/pi-sessions/abcd.jsonl",
+              isStreaming: true,
+            });
+            rpcChildren.push(child);
+            return child;
+          });
+
+          const adapter = yield* PiAdapter;
+          const threadId = asThreadId("thread-pi-rpc-resumed");
+
+          yield* adapter.startSession({
+            provider: "pi",
+            threadId,
+            runtimeMode: "full-access",
+          });
+          yield* Effect.sleep(20); // allow get_state round-trip
+
+          const sessions = yield* adapter.listSessions();
+          const session = sessions.find((s) => s.threadId === threadId)!;
+          assert.equal(
+            session.status,
+            "running",
+            "session should be running since pi is already streaming",
+          );
+          assert.ok(session.activeTurnId, "a placeholder turn should be active");
+
+          // Next sendTurn should hit our local guard (cleaner than pi's cryptic error).
+          const attempt = yield* adapter
+            .sendTurn({ threadId, input: "too soon" })
+            .pipe(Effect.flip);
+          assert.equal(attempt._tag, "ProviderAdapterRequestError");
+        }).pipe(Effect.provide(makeTestLayer("rpc"))),
+      );
+    });
+
+    it("translates pi 'already processing' error into an actionable message", async () => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const { rpcChildren } = installRpcSpawnMock();
+          const adapter = yield* PiAdapter;
+          const threadId = asThreadId("thread-pi-rpc-already-processing");
+
+          yield* adapter.startSession({
+            provider: "pi",
+            threadId,
+            runtimeMode: "full-access",
+          });
+          yield* Effect.sleep(10);
+          const child = rpcChildren[0]!;
+
+          const sendPromise = Effect.runPromise(
+            adapter.sendTurn({ threadId, input: "hi" }).pipe(Effect.provide(makeTestLayer("rpc"))),
+          );
+          yield* Effect.sleep(10);
+          const promptFrame = child.writtenFrames().find((f) => f.type === "prompt")!;
+          // Pi rejects with its real error string.
+          child.respondTo(promptFrame, {
+            success: false,
+            error: "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
+          });
+          yield* Effect.promise(() => sendPromise);
+
+          // Next sendTurn should rebound off our guard (we synthesized an activeTurn).
+          const nextAttempt = yield* adapter
+            .sendTurn({ threadId, input: "retry" })
+            .pipe(Effect.flip);
+          assert.equal(nextAttempt._tag, "ProviderAdapterRequestError");
+          assert.match(
+            (nextAttempt as { detail: string }).detail,
+            /in flight/i,
+            "second sendTurn should be blocked by the post-error state sync",
+          );
+        }).pipe(Effect.provide(makeTestLayer("rpc"))),
+      );
+    });
+
+    it("turn.started reports the pi-active model when a bare-slug switch is skipped", async () => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const { rpcChildren } = installRpcSpawnMock();
+          const adapter = yield* PiAdapter;
+          const threadId = asThreadId("thread-pi-rpc-turnstarted-effective");
+
+          yield* adapter.startSession({
+            provider: "pi",
+            threadId,
+            runtimeMode: "full-access",
+            modelSelection: { provider: "pi", model: "openai-codex/gpt-5.4" },
+          });
+          yield* Effect.sleep(10);
+          const child = rpcChildren[0]!;
+
+          const eventsFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 2)).pipe(
+            Effect.forkChild,
+          );
+          yield* Effect.sleep(0);
+
+          const sendPromise = Effect.runPromise(
+            adapter
+              .sendTurn({
+                threadId,
+                input: "go",
+                modelSelection: { provider: "pi", model: "claude-haiku-4-5" }, // bare
+              })
+              .pipe(Effect.provide(makeTestLayer("rpc"))),
+          );
+          yield* Effect.sleep(10);
+          const promptFrame = child.writtenFrames().find((f) => f.type === "prompt")!;
+          child.respondTo(promptFrame, { success: true });
+          child.notify({
+            type: "turn_end",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "k" }],
+              stopReason: "stop",
+            },
+          });
+          yield* Effect.promise(() => sendPromise);
+
+          const events = yield* joinEvents(eventsFiber);
+          const started = events.find((e) => e.type === "turn.started");
+          assert.ok(started);
+          if (started?.type !== "turn.started") throw new Error();
+          assert.equal(
+            started.payload.model,
+            "openai-codex/gpt-5.4",
+            "turn.started should announce the pi-active model, not the requested one",
+          );
+        }).pipe(Effect.provide(makeTestLayer("rpc"))),
+      );
+    });
+
+    it("surfaces runtime.warning and auto-cancels extension_ui_request dialogs", async () => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const { rpcChildren } = installRpcSpawnMock();
+          const adapter = yield* PiAdapter;
+          const threadId = asThreadId("thread-pi-rpc-ext-ui");
+
+          yield* adapter.startSession({
+            provider: "pi",
+            threadId,
+            runtimeMode: "full-access",
+          });
+          yield* Effect.sleep(10);
+          const child = rpcChildren[0]!;
+
+          const eventsFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 1)).pipe(
+            Effect.forkChild,
+          );
+          yield* Effect.sleep(0);
+
+          child.notify({
+            type: "extension_ui_request",
+            id: "ext-req-1",
+            method: "confirm",
+            title: "Allow?",
+            message: "Proceed?",
+          });
+          yield* Effect.sleep(10);
+
+          const events = yield* joinEvents(eventsFiber);
+          const warn = events.find((e) => e.type === "runtime.warning");
+          assert.ok(warn, "extension_ui_request should surface a runtime.warning");
+          if (warn?.type !== "runtime.warning") throw new Error();
+          assert.match(warn.payload.message, /extension requested 'confirm'/);
+
+          const cancelFrame = child
+            .writtenFrames()
+            .find((f) => f.type === "extension_ui_response");
+          assert.ok(cancelFrame, "should auto-send extension_ui_response for dialog methods");
+          assert.equal(cancelFrame?.id, "ext-req-1");
+          assert.equal(cancelFrame?.cancelled, true);
         }).pipe(Effect.provide(makeTestLayer("rpc"))),
       );
     });

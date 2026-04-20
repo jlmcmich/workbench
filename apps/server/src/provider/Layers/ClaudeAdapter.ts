@@ -3188,6 +3188,15 @@ const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     ).pipe(Effect.tap(() => Queue.shutdown(runtimeEventQueue))),
   );
 
+  const queueMessage: ClaudeAdapterShape["queueMessage"] = () =>
+    Effect.fail(
+      new ProviderAdapterRequestError({
+        provider: PROVIDER,
+        method: "queueMessage",
+        detail: "Claude does not support message queueing.",
+      }),
+    );
+
   return {
     provider: PROVIDER,
     capabilities: {
@@ -3196,6 +3205,7 @@ const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     startSession,
     sendTurn,
     interruptTurn,
+    queueMessage,
     readThread,
     rollbackThread,
     respondToRequest,

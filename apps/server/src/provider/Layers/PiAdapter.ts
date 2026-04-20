@@ -104,6 +104,11 @@ interface PiSessionContext {
    */
   piSessionUuid: string | undefined;
   /**
+   * Absolute path to pi's session JSONL file. Surfaced via `get_state` on
+   * RPC bootstrap so future phases can call `switch_session` on restart.
+   */
+  piSessionFile: string | undefined;
+  /**
    * Last usage snapshot derived from `AssistantMessage.usage` on pi's
    * `message_end`/`turn_end` events, carried forward across turns so the
    * context-window UI reflects cumulative usage.
@@ -675,12 +680,74 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
           case "plan_mode":
           case "attachment":
             return;
+          case "extension_ui_request": {
+            // Pi extensions can request interactive UI (confirm/select/input/
+            // editor) or fire-and-forget status (notify/setStatus/setWidget/
+            // setTitle/set_editor_text). The full bridge to our approval and
+            // user-input surfaces lands in Phase 2.4. Until then, surface the
+            // request as a warning so users aren't left wondering why nothing
+            // happened, and immediately answer dialog methods with a
+            // `cancelled: true` response so pi's extension doesn't block on
+            // us waiting for input we won't provide.
+            const method = asTrimmedString(raw.method) ?? "unknown";
+            const requestId = asTrimmedString(raw.id);
+            const isDialog =
+              method === "select" ||
+              method === "confirm" ||
+              method === "input" ||
+              method === "editor";
+            void emitPromise({
+              ...buildEventBase({ threadId: ctx.threadId }),
+              type: "runtime.warning",
+              payload: {
+                message: `pi extension requested '${method}'; this transport doesn't bridge extension UI yet (Phase 2.4). The request was auto-cancelled.`,
+              },
+            }).catch(() => undefined);
+            if (isDialog && requestId && ctx.rpc) {
+              try {
+                ctx.rpc.send({
+                  type: "extension_ui_response",
+                  id: requestId,
+                  cancelled: true,
+                });
+              } catch {
+                // rpc might already be torn down — pi's own timeout handles it.
+              }
+            }
+            return;
+          }
         }
 
         // Every other event is turn-scoped. If pi emits one when no turn is
         // active (e.g. during a racing abort, or from an extension after
         // turn_end), drop it quietly rather than crash.
         if (!turn) return;
+        if (kind === "queue_update") {
+          const steeringList = Array.isArray(raw.steering)
+            ? raw.steering.flatMap((entry) =>
+                typeof entry === "string"
+                  ? [entry]
+                  : isRecord(entry) && typeof entry.text === "string"
+                    ? [entry.text]
+                    : [],
+              )
+            : [];
+          const followUpList = Array.isArray(raw.followUp)
+            ? raw.followUp.flatMap((entry) =>
+                typeof entry === "string"
+                  ? [entry]
+                  : isRecord(entry) && typeof entry.text === "string"
+                    ? [entry.text]
+                    : [],
+              )
+            : [];
+          void emitPromise({
+            ...buildEventBase({ threadId: ctx.threadId, turnId: turn.turnId }),
+            type: "turn.queue.updated",
+            payload: { steering: steeringList, followUp: followUpList },
+          }).catch(() => undefined);
+          return;
+        }
         switch (kind) {
 
           case "plan":
@@ -1219,6 +1286,7 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
             stopped: false,
             transport,
             piSessionUuid: undefined,
+            piSessionFile: undefined,
             lastKnownTokenUsage: undefined,
             rpc: undefined,
             rpcChild: undefined,
@@ -1258,6 +1326,70 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
             ctx.rpcActiveModel = normalizedModel;
             ctx.rpcMaxTokens = capacityMap.get(rpcModel) ?? capacityMap.get(normalizedModel);
             attachSessionListeners(ctx);
+
+            // Sync adapter state with pi's own view. Pi persists `isStreaming`
+            // in its session file, so reconnecting to a dormant thread where
+            // a previous turn queued a follow_up — or where the prior child
+            // exited mid-turn — can land us with a busy pi even though our
+            // activeTurn is undefined. Without this sync the next sendTurn
+            // would call `prompt` and pi would reject with "Agent is already
+            // processing". A 2s timeout keeps startSession snappy even if pi
+            // hangs on the state call.
+            const stateProbe = yield* Effect.promise(() =>
+              Promise.race([
+                ctx.rpc!.call<{
+                  sessionId?: string;
+                  sessionFile?: string;
+                  isStreaming?: boolean;
+                  model?: { provider?: string; modelId?: string };
+                }>("get_state"),
+                new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 2_000)),
+              ]),
+            );
+            if (stateProbe !== "timeout" && stateProbe.success) {
+              const state = stateProbe.data ?? {};
+              if (typeof state.sessionId === "string") {
+                ctx.piSessionUuid = state.sessionId;
+              }
+              if (typeof state.sessionFile === "string") {
+                ctx.piSessionFile = state.sessionFile;
+              }
+              if (state.isStreaming === true) {
+                // pi is mid-turn from a prior session. Stand up a placeholder
+                // turn so our sendTurn guard (and the UI's running state) see
+                // the same reality pi sees; the next turn_end notification
+                // clears it through the existing handlePiEvent path.
+                const resumedTurnId = TurnId.make(`pi-turn-resumed-${randomUUID()}`);
+                const resumedTurn: PiTurnContext = {
+                  turnId: resumedTurnId,
+                  child: undefined,
+                  settled: false,
+                  assistantTextSeen: false,
+                  toolItems: new Map(),
+                  maxTokens: ctx.rpcMaxTokens,
+                };
+                ctx.activeTurn = resumedTurn;
+                ctx.session = {
+                  ...ctx.session,
+                  status: "running",
+                  activeTurnId: resumedTurnId,
+                  updatedAt: nowIso(),
+                };
+                yield* emit({
+                  ...buildEventBase({ threadId: input.threadId, turnId: resumedTurnId }),
+                  type: "turn.started",
+                  payload: { model: normalizedModel },
+                });
+                yield* emit({
+                  ...buildEventBase({ threadId: input.threadId }),
+                  type: "runtime.warning",
+                  payload: {
+                    message:
+                      "pi was already processing when we reconnected; resuming the in-flight turn.",
+                  },
+                });
+              }
+            }
           }
 
           sessions.set(input.threadId, ctx);
@@ -1435,7 +1567,12 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
             yield* emit({
               ...buildEventBase({ threadId: input.threadId, turnId }),
               type: "turn.started",
-              payload: { model },
+              // Emit the model pi is actually running, not the one the user
+              // asked for. These can diverge when set_model fails or the
+              // slug is bare (see runtime.warning above) — in that case the
+              // UI would otherwise claim the turn uses a model pi never
+              // switched to.
+              payload: { model: effectiveModel },
             });
 
             // Fire-and-forget: we don't await the prompt response because
@@ -1448,6 +1585,18 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
               }),
             );
             if (!promptResult.success) {
+              // pi can reject prompt calls with "Agent is already processing"
+              // when its session file carried a pending turn from a prior
+              // run (see Phase 2.3b). Our get_state bootstrap usually
+              // handles this, but pi state can also advance between startup
+              // and the user's first send. Rewrite the error so the UI can
+              // suggest queueMessage("steer"|"followUp") instead of showing
+              // pi's raw text.
+              const errText = promptResult.error;
+              const busy = /already processing/i.test(errText);
+              const detail = busy
+                ? "pi is already processing a turn on this thread — use queueMessage('steer') to nudge it or queueMessage('followUp') to run your message after it finishes."
+                : `pi prompt failed: ${errText}`;
               if (!turn.settled) {
                 turn.settled = true;
                 yield* emit({
@@ -1455,11 +1604,33 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
                   type: "turn.completed",
                   payload: {
                     state: "failed",
-                    errorMessage: `pi prompt failed: ${promptResult.error}`,
+                    errorMessage: detail,
                   },
                 });
               }
               clearActiveTurn(ctx, turn);
+
+              // If pi says it's busy, our state disagreed — resync now so
+              // the next sendTurn hits the local guard instead of another
+              // round-trip to pi. We do this opportunistically rather than
+              // on every failure.
+              if (busy) {
+                const resumedTurnId = TurnId.make(`pi-turn-resumed-${randomUUID()}`);
+                ctx.activeTurn = {
+                  turnId: resumedTurnId,
+                  child: undefined,
+                  settled: false,
+                  assistantTextSeen: false,
+                  toolItems: new Map(),
+                  maxTokens: ctx.rpcMaxTokens,
+                };
+                ctx.session = {
+                  ...ctx.session,
+                  status: "running",
+                  activeTurnId: resumedTurnId,
+                  updatedAt: nowIso(),
+                };
+              }
             }
 
             return { threadId: input.threadId, turnId };
@@ -1530,16 +1701,24 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
           if (ctx.transport === "rpc" && ctx.rpc) {
             // Graceful abort: pi responds with a turn_end whose stopReason
             // reflects the cancellation, which our notification pump maps
-            // to `turn.completed{state:"interrupted"}`. If the abort RPC
-            // fails (e.g. pi hung) we fall back to SIGKILL on the rpc child.
-            const abortResult = yield* Effect.promise(() => ctx.rpc!.call("abort"));
-            if (!abortResult.success) {
-              if (ctx.rpcChild && !ctx.rpcChild.killed) {
-                try {
-                  ctx.rpcChild.kill("SIGKILL");
-                } catch {
-                  // ignore
-                }
+            // to `turn.completed{state:"interrupted"}`. We cap the wait at
+            // 2s so a hung pi process can't stall our session; SIGKILL is
+            // the last-resort fallback on either timeout or explicit
+            // failure.
+            const abortOutcome = yield* Effect.promise(() =>
+              Promise.race([
+                ctx.rpc!.call("abort"),
+                new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 2_000)),
+              ]),
+            );
+            const abortFailed =
+              abortOutcome === "timeout" ||
+              (typeof abortOutcome === "object" && abortOutcome.success === false);
+            if (abortFailed && ctx.rpcChild && !ctx.rpcChild.killed) {
+              try {
+                ctx.rpcChild.kill("SIGKILL");
+              } catch {
+                // ignore
               }
             }
             return;
@@ -1548,6 +1727,58 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
           // JSON transport: kill the per-turn child; exit handler emits
           // turn.completed{state:"interrupted"}.
           killTurn(active);
+        });
+
+      const queueMessage: PiAdapterShape["queueMessage"] = (threadId, kind, input) =>
+        Effect.gen(function* () {
+          const ctx = yield* requireSession(threadId);
+          if (ctx.transport !== "rpc" || !ctx.rpc) {
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "queueMessage",
+              detail: "pi queueing requires the rpc transport.",
+            });
+          }
+          if (!ctx.activeTurn) {
+            return yield* new ProviderAdapterValidationError({
+              provider: PROVIDER,
+              operation: "queueMessage",
+              issue: "No pi turn is in flight; use sendTurn to start one.",
+            });
+          }
+          const message = input.input?.trim();
+          if (!message || message.length === 0) {
+            return yield* new ProviderAdapterValidationError({
+              provider: PROVIDER,
+              operation: "queueMessage",
+              issue: "Queued pi messages require non-empty text input.",
+            });
+          }
+
+          const attachments = input.attachments ?? [];
+          const piImages =
+            attachments.length > 0
+              ? yield* Effect.forEach(
+                  attachments,
+                  (attachment) => resolvePiImageAttachment(threadId, attachment),
+                  { concurrency: 1 },
+                )
+              : [];
+
+          const rpcMethod = kind === "steer" ? "steer" : "follow_up";
+          const result = yield* Effect.promise(() =>
+            ctx.rpc!.call(rpcMethod, {
+              message,
+              ...(piImages.length > 0 ? { images: piImages } : {}),
+            }),
+          );
+          if (!result.success) {
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "queueMessage",
+              detail: `pi ${rpcMethod} failed: ${result.error}`,
+            });
+          }
         });
 
       const respondToRequest: PiAdapterShape["respondToRequest"] = () =>
@@ -1658,10 +1889,15 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
 
       return {
         provider: PROVIDER,
-        capabilities: { sessionModelSwitch: "unsupported" },
+        // pi supports mid-session model swaps via the RPC `set_model` command;
+        // JSON-mode falls back to per-turn `--model` flags on each spawn.
+        // Both paths respect the composer's per-turn model selection, so the
+        // capability is declared "in-session" at the adapter level.
+        capabilities: { sessionModelSwitch: "in-session" },
         startSession,
         sendTurn,
         interruptTurn,
+        queueMessage,
         respondToRequest,
         respondToUserInput,
         stopSession,
