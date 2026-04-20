@@ -1,18 +1,27 @@
 /**
- * PiAdapterLive — pi coding agent (`pi -p --mode json`) per-turn subprocess.
+ * PiAdapterLive — pi coding agent adapter with two transports.
  *
- * pi is spawned anew for each `sendTurn` call. stdout is parsed line-by-line
- * as NDJSON and mapped onto the canonical ProviderRuntimeEvent stream. The
- * first line of pi's JSON output is a session header carrying a UUID; we
- * capture it on the first turn and pass `--session <uuid>` on subsequent
- * turns so pi restores the prior transcript and tool-call state from
- * `~/.pi/agent/sessions/`. Extended prompt caching is enabled via
- * `PI_CACHE_RETENTION=long` on the child env. A single subprocess is tracked
- * per-thread so it can be SIGKILL'd on interrupt or session stop.
+ * **RPC transport (default, `providers.pi.transport: "rpc"`).** One long-lived
+ * `pi --mode rpc` child per session. `sendTurn` writes a `{type:"prompt"}`
+ * frame to stdin; notifications (`message_update`, `tool_execution_*`,
+ * `turn_end`, `extension_ui_request`, etc) stream back over stdout and are
+ * mapped onto the canonical `ProviderRuntimeEvent` stream. Interrupt is a
+ * graceful `{type:"abort"}` RPC, not a process kill. Pi owns session
+ * persistence at `~/.pi/agent/sessions/` and the single process keeps the
+ * prompt cache warm across turns.
  *
- * Unsupported features (approvals, structured user-input, rollback) fail
- * fast with ProviderAdapterRequestError; `readThread` returns an empty
- * snapshot since pi owns the transcript on its side.
+ * **JSON transport (fallback, `providers.pi.transport: "json"`).** Legacy
+ * per-turn subprocess path: `pi -p --mode json --model <slug> <prompt>`
+ * spawned anew for each `sendTurn`, with `--session <uuid>` appended after
+ * the first turn's session header is captured. Retained until the RPC path
+ * has proven stable in the field (see Phase 2 plan).
+ *
+ * Extended prompt caching via `PI_CACHE_RETENTION=long` is enabled on both
+ * transports.
+ *
+ * Unsupported features (approvals, structured user-input, rollback) still
+ * fail fast with ProviderAdapterRequestError in both modes; `readThread`
+ * returns an empty snapshot. Those are scheduled for Phase 2.2+.
  *
  * @module PiAdapterLive
  */
@@ -22,6 +31,7 @@ import { randomUUID } from "node:crypto";
 import {
   RuntimeItemId,
   EventId,
+  type PiTransport,
   type ProviderRuntimeEvent,
   type ProviderSession,
   type ThreadId,
@@ -41,6 +51,7 @@ import {
 } from "../Errors.ts";
 import { PiAdapter, type PiAdapterShape } from "../Services/PiAdapter.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
+import { createPiRpcClient, type PiRpcClientShape } from "./PiRpcClient.ts";
 
 import {
   DEFAULT_PI_MODEL_SLUG,
@@ -60,7 +71,12 @@ export interface PiAdapterLiveOptions {
 
 interface PiTurnContext {
   readonly turnId: TurnId;
-  readonly child: ChildProcess;
+  /**
+   * Per-turn subprocess (JSON transport only). Undefined when the turn is
+   * running against a long-lived RPC session — the RPC child lives on
+   * `PiSessionContext`, not on the turn.
+   */
+  readonly child: ChildProcess | undefined;
   /** Set true once we have emitted a terminal turn event (completed / aborted / failed). */
   settled: boolean;
   /** True once any assistant text delta has been emitted for the turn. */
@@ -76,11 +92,12 @@ interface PiSessionContext {
   session: ProviderSession;
   activeTurn: PiTurnContext | undefined;
   stopped: boolean;
+  /** Which transport this session is running on. Decided at startSession time. */
+  readonly transport: PiTransport;
   /**
    * pi's session UUID, captured from the first `{"type":"session","id":...}`
-   * line of NDJSON output. Undefined until the first turn emits one; passed
-   * back via `--session <uuid>` on every subsequent turn so pi resumes the
-   * existing transcript and tool state.
+   * JSON-mode line or from `get_state` in RPC mode. Used to resume pi's own
+   * session state across transport restarts.
    */
   piSessionUuid: string | undefined;
   /**
@@ -89,6 +106,22 @@ interface PiSessionContext {
    * context-window UI reflects cumulative usage.
    */
   lastKnownTokenUsage: ThreadTokenUsageSnapshot | undefined;
+  /**
+   * Long-lived RPC transport handle (RPC transport only). Retained across
+   * turns so a single process keeps pi's session memory and prompt cache
+   * warm. Undefined for JSON-mode sessions.
+   */
+  rpc: PiRpcClientShape | undefined;
+  rpcChild: ChildProcess | undefined;
+  /**
+   * Model string currently active on pi in RPC mode. When a subsequent
+   * `sendTurn` requests a different model we issue `set_model` before
+   * `prompt`; in JSON mode each turn spawn passes `--model` so this field
+   * stays undefined.
+   */
+  rpcActiveModel: string | undefined;
+  /** Max-tokens capacity for the active RPC model, for usage snapshot shaping. */
+  rpcMaxTokens: number | undefined;
 }
 
 interface PiToolState {
@@ -104,10 +137,34 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
+/**
+ * Split a Workbench `{backend}/{model}` slug into the RPC-flag pair
+ * pi expects on `--provider <backend> --model <model>`. Bare slugs return
+ * `{ provider: undefined }` — pi then picks a default backend that supports
+ * the model. Mirrors the routing rules documented in pi's `--mode rpc`
+ * section of `packages/coding-agent/docs/rpc.md`.
+ */
+function splitPiModelSlug(slug: string): {
+  readonly provider: string | undefined;
+  readonly model: string;
+} {
+  const trimmed = normalizePiModelSlug(slug);
+  const slash = trimmed.indexOf("/");
+  if (slash <= 0 || slash === trimmed.length - 1) {
+    return { provider: undefined, model: trimmed };
+  }
+  return {
+    provider: trimmed.slice(0, slash),
+    model: trimmed.slice(slash + 1),
+  };
+}
+
 function killTurn(turn: PiTurnContext, signal: NodeJS.Signals = "SIGKILL") {
-  if (!turn.child.killed) {
+  const { child } = turn;
+  if (!child) return; // RPC turn — abort is issued via rpc.call("abort") instead.
+  if (!child.killed) {
     try {
-      turn.child.kill(signal);
+      child.kill(signal);
     } catch {
       // Best effort — process may have already exited.
     }
@@ -504,7 +561,11 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
         return Effect.succeed(ctx);
       };
 
-      const handlePiEvent = (ctx: PiSessionContext, turn: PiTurnContext, raw: unknown) => {
+      const handlePiEvent = (
+        ctx: PiSessionContext,
+        turn: PiTurnContext | undefined,
+        raw: unknown,
+      ) => {
         if (!isRecord(raw)) return;
         writeNativeEventBestEffort(ctx.threadId, raw);
 
@@ -523,6 +584,13 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
           case "plan_mode":
           case "attachment":
             return;
+        }
+
+        // Every other event is turn-scoped. If pi emits one when no turn is
+        // active (e.g. during a racing abort, or from an extension after
+        // turn_end), drop it quietly rather than crash.
+        if (!turn) return;
+        switch (kind) {
 
           case "plan":
           case "todos": {
@@ -830,6 +898,7 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
         stderrBuf: { value: string },
       ) => {
         const child = turn.child;
+        if (!child) return; // RPC mode uses session-level listeners instead.
         let stdoutBuffer = "";
 
         const consumeLines = (flush: boolean): void => {
@@ -922,6 +991,56 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
         });
       };
 
+      /**
+       * Wire a newly-spawned RPC child to the session's event pipeline. On
+       * notifications we dispatch through the canonical `handlePiEvent`;
+       * on unexpected exit we emit `session.exited` and tear down any
+       * in-flight turn as interrupted.
+       */
+      const attachSessionListeners = (ctx: PiSessionContext) => {
+        const rpc = ctx.rpc;
+        if (!rpc) return;
+
+        rpc.onNotification((raw) => {
+          handlePiEvent(ctx, ctx.activeTurn, raw);
+        });
+
+        rpc.onExit((code, signal) => {
+          if (ctx.stopped) return; // Expected path: stopSession already tore down.
+
+          const interrupted = signal === "SIGKILL" || signal === "SIGTERM";
+          if (ctx.activeTurn && !ctx.activeTurn.settled) {
+            ctx.activeTurn.settled = true;
+            const turnId = ctx.activeTurn.turnId;
+            void emitPromise({
+              ...buildEventBase({ threadId: ctx.threadId, turnId }),
+              type: "turn.completed",
+              payload: interrupted
+                ? { state: "interrupted", stopReason: "interrupted" }
+                : {
+                    state: "failed",
+                    errorMessage: `pi rpc exited with code ${code ?? "unknown"} during turn.`,
+                  },
+            }).catch(() => undefined);
+            ctx.activeTurn = undefined;
+          }
+
+          ctx.stopped = true;
+          void emitPromise({
+            ...buildEventBase({ threadId: ctx.threadId }),
+            type: "session.exited",
+            payload: {
+              reason: interrupted
+                ? "pi rpc child killed"
+                : `pi rpc child exited with code ${code ?? "unknown"}`,
+              recoverable: false,
+              exitKind: interrupted ? "graceful" : "error",
+            },
+          }).catch(() => undefined);
+          sessions.delete(ctx.threadId);
+        });
+      };
+
       const startSession: PiAdapterShape["startSession"] = (input) =>
         Effect.gen(function* () {
           if (input.provider !== undefined && input.provider !== PROVIDER) {
@@ -938,6 +1057,20 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
             if (existing.activeTurn) {
               killTurn(existing.activeTurn);
             }
+            if (existing.rpc) {
+              try {
+                existing.rpc.dispose("replacing pi session");
+              } catch {
+                // ignore
+              }
+            }
+            if (existing.rpcChild && !existing.rpcChild.killed) {
+              try {
+                existing.rpcChild.kill("SIGTERM");
+              } catch {
+                // ignore
+              }
+            }
             existing.stopped = true;
             sessions.delete(input.threadId);
           }
@@ -945,12 +1078,32 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
           const createdAt = nowIso();
           const modelSelection =
             input.modelSelection?.provider === PROVIDER ? input.modelSelection : undefined;
+
+          const piSettings = yield* serverSettings.getSettings.pipe(
+            Effect.map((s) => s.providers.pi),
+            Effect.mapError(
+              (cause) =>
+                new ProviderAdapterProcessError({
+                  provider: PROVIDER,
+                  threadId: input.threadId,
+                  detail: cause.message,
+                  cause,
+                }),
+            ),
+          );
+          const binaryPath =
+            piSettings.binaryPath.trim().length > 0 ? piSettings.binaryPath : "pi";
+          const transport: PiTransport = piSettings.transport;
+          const rawModelForSession =
+            modelSelection?.model ?? (piSettings.defaultModel || DEFAULT_MODEL);
+          const normalizedModel = normalizePiModelSlug(rawModelForSession);
+
           const session: ProviderSession = {
             provider: PROVIDER,
             status: "ready",
             runtimeMode: input.runtimeMode,
             ...(input.cwd ? { cwd: input.cwd } : {}),
-            ...(modelSelection ? { model: modelSelection.model } : {}),
+            model: normalizedModel,
             threadId: input.threadId,
             createdAt,
             updatedAt: createdAt,
@@ -961,9 +1114,49 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
             session,
             activeTurn: undefined,
             stopped: false,
+            transport,
             piSessionUuid: undefined,
             lastKnownTokenUsage: undefined,
+            rpc: undefined,
+            rpcChild: undefined,
+            rpcActiveModel: undefined,
+            rpcMaxTokens: undefined,
           };
+
+          if (transport === "rpc") {
+            const capacityMap = yield* Effect.promise(() =>
+              resolveModelContextWindow(binaryPath),
+            );
+            const { provider: rpcProvider, model: rpcModel } =
+              splitPiModelSlug(normalizedModel);
+            const args: string[] = ["--mode", "rpc"];
+            if (rpcProvider) args.push("--provider", rpcProvider);
+            args.push("--model", rpcModel);
+
+            const rpcChild = yield* Effect.try({
+              try: () =>
+                spawn(binaryPath, args, {
+                  stdio: ["pipe", "pipe", "pipe"],
+                  shell: process.platform === "win32",
+                  env: { ...process.env, PI_CACHE_RETENTION: "long" },
+                  ...(input.cwd ? { cwd: input.cwd } : {}),
+                }),
+              catch: (cause) =>
+                new ProviderAdapterProcessError({
+                  provider: PROVIDER,
+                  threadId: input.threadId,
+                  detail: cause instanceof Error ? cause.message : "Failed to spawn pi rpc.",
+                  cause,
+                }),
+            });
+
+            ctx.rpcChild = rpcChild;
+            ctx.rpc = createPiRpcClient(rpcChild);
+            ctx.rpcActiveModel = normalizedModel;
+            ctx.rpcMaxTokens = capacityMap.get(rpcModel) ?? capacityMap.get(normalizedModel);
+            attachSessionListeners(ctx);
+          }
+
           sessions.set(input.threadId, ctx);
 
           yield* emit({
@@ -1023,6 +1216,100 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
           const binaryPath = piSettings.binaryPath.trim().length > 0 ? piSettings.binaryPath : "pi";
 
           const turnId = TurnId.make(`pi-turn-${randomUUID()}`);
+
+          // ────────── RPC transport ──────────
+          if (ctx.transport === "rpc") {
+            const rpc = ctx.rpc;
+            if (!rpc || !ctx.rpcChild || ctx.rpcChild.exitCode !== null) {
+              return yield* new ProviderAdapterProcessError({
+                provider: PROVIDER,
+                threadId: input.threadId,
+                detail: "pi rpc child is not running; restart the session.",
+              });
+            }
+
+            // Refresh max-tokens against the catalog (cheap after first
+            // lookup) and compute the target provider/model tuple.
+            const capacityMap = yield* Effect.promise(() =>
+              resolveModelContextWindow(binaryPath),
+            );
+            const { provider: rpcProvider, model: rpcModel } = splitPiModelSlug(model);
+            const maxTokens = capacityMap.get(rpcModel) ?? capacityMap.get(model);
+
+            // Switch model in pi if the requested one differs from the
+            // currently-active one. We do this even though mid-session
+            // switching isn't yet a first-class capability, because JSON
+            // mode has always respected per-turn model flips.
+            if (rpcProvider && ctx.rpcActiveModel !== model) {
+              const switchResult = yield* Effect.promise(() =>
+                rpc.call("set_model", { provider: rpcProvider, modelId: rpcModel }),
+              );
+              if (switchResult.success) {
+                ctx.rpcActiveModel = model;
+                ctx.rpcMaxTokens = maxTokens;
+              } else {
+                // Not fatal — pi will keep its current model. Surface as a
+                // warning and continue so the user still gets a response.
+                yield* emit({
+                  ...buildEventBase({ threadId: input.threadId }),
+                  type: "runtime.warning",
+                  payload: {
+                    message: `pi set_model failed: ${switchResult.error}`,
+                  },
+                });
+              }
+            }
+
+            const turn: PiTurnContext = {
+              turnId,
+              child: undefined,
+              settled: false,
+              assistantTextSeen: false,
+              toolItems: new Map(),
+              maxTokens: ctx.rpcMaxTokens ?? maxTokens,
+            };
+            ctx.activeTurn = turn;
+            ctx.session = {
+              ...ctx.session,
+              status: "running",
+              activeTurnId: turnId,
+              model,
+              updatedAt: nowIso(),
+            };
+
+            yield* emit({
+              ...buildEventBase({ threadId: input.threadId, turnId }),
+              type: "turn.started",
+              payload: { model },
+            });
+
+            // Fire-and-forget: we don't await the prompt response because
+            // it only acknowledges receipt. Turn completion flows through
+            // the notification pump (→ `turn_end`).
+            const promptResult = yield* Effect.promise(() =>
+              rpc.call("prompt", { message: prompt }),
+            );
+            if (!promptResult.success) {
+              if (!turn.settled) {
+                turn.settled = true;
+                yield* emit({
+                  ...buildEventBase({ threadId: input.threadId, turnId }),
+                  type: "turn.completed",
+                  payload: {
+                    state: "failed",
+                    errorMessage: `pi prompt failed: ${promptResult.error}`,
+                  },
+                });
+              }
+              if (ctx.activeTurn === turn) {
+                ctx.activeTurn = undefined;
+              }
+            }
+
+            return { threadId: input.threadId, turnId };
+          }
+
+          // ────────── JSON transport (legacy fallback) ──────────
           const resumeArgs = ctx.piSessionUuid ? ["--session", ctx.piSessionUuid] : [];
           const args = [...resumeArgs, "-p", "--mode", "json", "--model", model, prompt];
 
@@ -1083,8 +1370,28 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
           const active = ctx.activeTurn;
           if (!active) return;
           if (turnId !== undefined && active.turnId !== turnId) return;
+
+          if (ctx.transport === "rpc" && ctx.rpc) {
+            // Graceful abort: pi responds with a turn_end whose stopReason
+            // reflects the cancellation, which our notification pump maps
+            // to `turn.completed{state:"interrupted"}`. If the abort RPC
+            // fails (e.g. pi hung) we fall back to SIGKILL on the rpc child.
+            const abortResult = yield* Effect.promise(() => ctx.rpc!.call("abort"));
+            if (!abortResult.success) {
+              if (ctx.rpcChild && !ctx.rpcChild.killed) {
+                try {
+                  ctx.rpcChild.kill("SIGKILL");
+                } catch {
+                  // ignore
+                }
+              }
+            }
+            return;
+          }
+
+          // JSON transport: kill the per-turn child; exit handler emits
+          // turn.completed{state:"interrupted"}.
           killTurn(active);
-          // Exit handler will emit turn.completed{state: "interrupted"}.
         });
 
       const respondToRequest: PiAdapterShape["respondToRequest"] = () =>
@@ -1119,6 +1426,20 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
           if (ctx.activeTurn) {
             killTurn(ctx.activeTurn);
             ctx.activeTurn = undefined;
+          }
+          if (ctx.rpc) {
+            try {
+              ctx.rpc.dispose("session stopped");
+            } catch {
+              // ignore
+            }
+          }
+          if (ctx.rpcChild && !ctx.rpcChild.killed) {
+            try {
+              ctx.rpcChild.kill("SIGTERM");
+            } catch {
+              // ignore
+            }
           }
           sessions.delete(threadId);
           yield* emit({

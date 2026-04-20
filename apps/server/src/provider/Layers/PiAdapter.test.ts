@@ -42,6 +42,56 @@ class FakeChildProcess extends EventEmitter {
   }
 }
 
+class FakeWritable extends EventEmitter {
+  readonly frames: string[] = [];
+  destroyed = false;
+
+  write(chunk: string | Uint8Array): boolean {
+    const text = typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
+    this.frames.push(text);
+    return true;
+  }
+}
+
+class FakeRpcChildProcess extends EventEmitter {
+  readonly stdout = new FakeReadable();
+  readonly stderr = new FakeReadable();
+  readonly stdin = new FakeWritable();
+  killed = false;
+  exitCode: number | null = null;
+
+  kill(_signal?: NodeJS.Signals): boolean {
+    this.killed = true;
+    this.exitCode = 0;
+    this.emit("exit", 0, null);
+    return true;
+  }
+
+  /** Parse frames written to stdin as JSON and return them. */
+  writtenFrames(): Array<Record<string, unknown>> {
+    return this.stdin.frames
+      .join("")
+      .split("\n")
+      .filter((line) => line.trim().length > 0)
+      .map((line) => JSON.parse(line));
+  }
+
+  /** Emit a response correlated to a captured request id. */
+  respondTo(request: Record<string, unknown>, response: Record<string, unknown>): void {
+    const id = request.id;
+    const command = request.type;
+    this.stdout.emit(
+      "data",
+      `${JSON.stringify({ type: "response", command, id, ...response })}\n`,
+    );
+  }
+
+  /** Emit a non-response notification. */
+  notify(payload: Record<string, unknown>): void {
+    this.stdout.emit("data", `${JSON.stringify(payload)}\n`);
+  }
+}
+
 /**
  * Default spawn mock: collects every pi subprocess spawn, but short-circuits
  * the catalog probe (`pi --list-models`) so tests don't hang waiting for a
@@ -100,22 +150,29 @@ const joinEvents = <A, E>(fiber: Fiber.Fiber<A, E>) =>
     ),
   );
 
-const PiAdapterTestLayer = makePiAdapterLive().pipe(
-  Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
-  Layer.provideMerge(
-    ServerSettingsService.layerTest({
-      providers: {
-        pi: {
-          binaryPath: "fake-pi",
-          defaultProvider: "",
-          customModels: [],
-          enabled: true,
+const makeTestLayer = (transport: "json" | "rpc" = "json") =>
+  makePiAdapterLive().pipe(
+    Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
+    Layer.provideMerge(
+      ServerSettingsService.layerTest({
+        providers: {
+          pi: {
+            binaryPath: "fake-pi",
+            defaultProvider: "",
+            customModels: [],
+            enabled: true,
+            transport,
+          },
         },
-      },
-    }),
-  ),
-  Layer.provideMerge(NodeServices.layer),
-);
+      }),
+    ),
+    Layer.provideMerge(NodeServices.layer),
+  );
+
+// Existing tests were written against the JSON-mode transport; keep them
+// pinned so the fixture still feeds a per-turn subprocess. New RPC tests
+// opt in with `makeTestLayer("rpc")` + a FakeChildProcess that has stdin.
+const PiAdapterTestLayer = makeTestLayer("json");
 
 describe("PiAdapterLive", () => {
   it("maps current Pi tool execution events and assistant text from turn_end", async () => {
@@ -617,5 +674,185 @@ describe("PiAdapterLive", () => {
         assert.equal(usage.outputTokens, 567);
       }).pipe(Effect.provide(PiAdapterTestLayer)),
     );
+  });
+
+  describe("RPC transport", () => {
+    function installRpcSpawnMock(): { readonly rpcChildren: FakeRpcChildProcess[] } {
+      const rpcChildren: FakeRpcChildProcess[] = [];
+      spawnMock.mockReset();
+      spawnMock.mockImplementation((_bin: string, args: string[]) => {
+        if (args.includes("--list-models")) {
+          const catalog = new FakeChildProcess();
+          setImmediate(() => catalog.emit("exit", 0, null));
+          return catalog;
+        }
+        const child = new FakeRpcChildProcess();
+        rpcChildren.push(child);
+        return child;
+      });
+      return { rpcChildren };
+    }
+
+    it("spawns a long-lived rpc child and reuses it across turns", async () => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const { rpcChildren } = installRpcSpawnMock();
+
+          const adapter = yield* PiAdapter;
+          const threadId = asThreadId("thread-pi-rpc-persistence");
+
+          yield* adapter.startSession({
+            provider: "pi",
+            threadId,
+            runtimeMode: "full-access",
+          });
+          yield* Effect.sleep(10); // allow catalog probe + attachSessionListeners
+
+          assert.equal(rpcChildren.length, 1, "exactly one rpc child after startSession");
+          const child = rpcChildren[0]!;
+
+          // First turn
+          const sendPromise1 = Effect.runPromise(
+            adapter.sendTurn({ threadId, input: "hello" }).pipe(Effect.provide(makeTestLayer("rpc"))),
+          );
+          yield* Effect.sleep(10);
+          const frames1 = child.writtenFrames();
+          const firstPrompt = frames1.find((f) => f.type === "prompt");
+          assert.ok(firstPrompt, "prompt frame should be written");
+          assert.equal(firstPrompt?.message, "hello");
+          child.respondTo(firstPrompt!, { success: true });
+          child.notify({
+            type: "turn_end",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "ok" }],
+              stopReason: "stop",
+            },
+          });
+          yield* Effect.promise(() => sendPromise1);
+
+          // Second turn — same child, not a new spawn
+          const sendPromise2 = Effect.runPromise(
+            adapter.sendTurn({ threadId, input: "second" }).pipe(Effect.provide(makeTestLayer("rpc"))),
+          );
+          yield* Effect.sleep(10);
+          assert.equal(rpcChildren.length, 1, "no second spawn for second turn");
+
+          const frames2 = child.writtenFrames();
+          const secondPrompt = frames2.filter((f) => f.type === "prompt")[1];
+          assert.ok(secondPrompt, "second prompt frame should be written");
+          assert.equal(secondPrompt?.message, "second");
+          child.respondTo(secondPrompt!, { success: true });
+          child.notify({
+            type: "turn_end",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "done" }],
+              stopReason: "stop",
+            },
+          });
+          yield* Effect.promise(() => sendPromise2);
+        }).pipe(Effect.provide(makeTestLayer("rpc"))),
+      );
+    });
+
+    it("interruptTurn sends abort frame rather than killing the child", async () => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const { rpcChildren } = installRpcSpawnMock();
+
+          const adapter = yield* PiAdapter;
+          const threadId = asThreadId("thread-pi-rpc-abort");
+
+          yield* adapter.startSession({
+            provider: "pi",
+            threadId,
+            runtimeMode: "full-access",
+          });
+          yield* Effect.sleep(10);
+
+          const child = rpcChildren[0]!;
+
+          const sendPromise = Effect.runPromise(
+            adapter.sendTurn({ threadId, input: "long task" }).pipe(Effect.provide(makeTestLayer("rpc"))),
+          );
+          yield* Effect.sleep(10);
+          const promptFrame = child.writtenFrames().find((f) => f.type === "prompt")!;
+          child.respondTo(promptFrame, { success: true });
+          yield* Effect.promise(() => sendPromise);
+
+          // Fire abort
+          const abortPromise = Effect.runPromise(
+            adapter.interruptTurn(threadId).pipe(Effect.provide(makeTestLayer("rpc"))),
+          );
+          yield* Effect.sleep(10);
+          const abortFrame = child.writtenFrames().find((f) => f.type === "abort");
+          assert.ok(abortFrame, "abort frame should be written");
+          child.respondTo(abortFrame!, { success: true });
+          yield* Effect.promise(() => abortPromise);
+
+          assert.equal(child.killed, false, "rpc child should stay alive after abort");
+        }).pipe(Effect.provide(makeTestLayer("rpc"))),
+      );
+    });
+
+    it("emits thread.token-usage.updated from turn_end notifications in rpc mode", async () => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const { rpcChildren } = installRpcSpawnMock();
+
+          const adapter = yield* PiAdapter;
+          const threadId = asThreadId("thread-pi-rpc-usage");
+
+          yield* adapter.startSession({
+            provider: "pi",
+            threadId,
+            runtimeMode: "full-access",
+          });
+          yield* Effect.sleep(10);
+
+          const child = rpcChildren[0]!;
+
+          // Subscribe after startSession; we only need post-sendTurn events.
+          // Expected: turn.started, content.delta, thread.token-usage.updated, turn.completed.
+          const eventsFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 4)).pipe(
+            Effect.forkChild,
+          );
+          yield* Effect.sleep(0);
+
+          const sendPromise = Effect.runPromise(
+            adapter.sendTurn({ threadId, input: "estimate" }).pipe(Effect.provide(makeTestLayer("rpc"))),
+          );
+          yield* Effect.sleep(10);
+          const promptFrame = child.writtenFrames().find((f) => f.type === "prompt")!;
+          child.respondTo(promptFrame, { success: true });
+
+          child.notify({
+            type: "turn_end",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "answer" }],
+              stopReason: "stop",
+              usage: {
+                input: 100,
+                output: 50,
+                cacheRead: 20,
+                cacheWrite: 0,
+                totalTokens: 170,
+              },
+            },
+          });
+          yield* Effect.promise(() => sendPromise);
+
+          const events = yield* joinEvents(eventsFiber);
+          const usage = events.find((e) => e.type === "thread.token-usage.updated");
+          assert.ok(usage, "expected thread.token-usage.updated");
+          if (usage?.type !== "thread.token-usage.updated") throw new Error();
+          assert.equal(usage.payload.usage.usedTokens, 170);
+          assert.equal(usage.payload.usage.inputTokens, 120);
+          assert.equal(usage.payload.usage.outputTokens, 50);
+        }).pipe(Effect.provide(makeTestLayer("rpc"))),
+      );
+    });
   });
 });
