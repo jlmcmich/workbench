@@ -951,9 +951,7 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
                 },
               }).catch(() => undefined);
             }
-            if (ctx.activeTurn === turn) {
-              ctx.activeTurn = undefined;
-            }
+            clearActiveTurn(ctx, turn);
             return;
           }
 
@@ -971,9 +969,7 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
                 errorMessage: detail,
               },
             }).catch(() => undefined);
-            if (ctx.activeTurn === turn) {
-              ctx.activeTurn = undefined;
-            }
+            clearActiveTurn(ctx, turn);
             return;
           }
 
@@ -1040,15 +1036,13 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
               errorMessage: err.message.trim() || "pi subprocess errored.",
             },
           }).catch(() => undefined);
-          if (ctx.activeTurn === turn) {
-            ctx.activeTurn = undefined;
-          }
+          clearActiveTurn(ctx, turn);
         });
 
         child.once("exit", (code, signal) => {
           consumeLines(true);
           if (turn.settled) {
-            if (ctx.activeTurn === turn) ctx.activeTurn = undefined;
+            clearActiveTurn(ctx, turn);
             return;
           }
           turn.settled = true;
@@ -1076,10 +1070,28 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
               },
             }).catch(() => undefined);
           }
-          if (ctx.activeTurn === turn) {
-            ctx.activeTurn = undefined;
-          }
+          clearActiveTurn(ctx, turn);
         });
+      };
+
+      /**
+       * Clear `ctx.activeTurn` and snap the session back to its idle shape.
+       * Call-sites used to only reset `ctx.activeTurn`, which left
+       * `session.status` stuck on `"running"` and `activeTurnId` dangling —
+       * so `listSessions()` reported every thread as permanently busy after
+       * the first turn. Pass `turnBeingCleared` when multiple turns could
+       * be racing the pointer (e.g. the RPC session-exit path vs a `turn_end`
+       * notification); we only reset if that turn is still the active one.
+       */
+      const clearActiveTurn = (ctx: PiSessionContext, turnBeingCleared?: PiTurnContext) => {
+        if (turnBeingCleared && ctx.activeTurn !== turnBeingCleared) return;
+        ctx.activeTurn = undefined;
+        const { activeTurnId: _ignored, ...rest } = ctx.session;
+        ctx.session = {
+          ...rest,
+          status: "ready",
+          updatedAt: nowIso(),
+        };
       };
 
       /**
@@ -1113,7 +1125,7 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
                     errorMessage: `pi rpc exited with code ${code ?? "unknown"} during turn.`,
                   },
             }).catch(() => undefined);
-            ctx.activeTurn = undefined;
+            clearActiveTurn(ctx);
           }
 
           ctx.stopped = true;
@@ -1284,6 +1296,19 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
             });
           }
 
+          // One turn at a time per thread. In RPC mode a second `prompt`
+          // frame while one is in flight would interleave notifications
+          // and break turn attribution; in JSON mode it would spawn a
+          // second subprocess. Phase 2.3 will supersede this with
+          // automatic routing to `steer` / `follow_up` queues.
+          if (ctx.activeTurn) {
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "sendTurn",
+              detail: "A pi turn is already in flight on this thread; wait for it to settle or interrupt.",
+            });
+          }
+
           // Attachments are only supported on the RPC transport — JSON mode's
           // per-turn CLI invocation has no path to stream image bytes. In RPC
           // mode we resolve them up front so a bad attachment blocks the
@@ -1350,24 +1375,41 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
             const maxTokens = capacityMap.get(rpcModel) ?? capacityMap.get(model);
 
             // Switch model in pi if the requested one differs from the
-            // currently-active one. We do this even though mid-session
-            // switching isn't yet a first-class capability, because JSON
-            // mode has always respected per-turn model flips.
-            if (rpcProvider && ctx.rpcActiveModel !== model) {
-              const switchResult = yield* Effect.promise(() =>
-                rpc.call("set_model", { provider: rpcProvider, modelId: rpcModel }),
-              );
-              if (switchResult.success) {
-                ctx.rpcActiveModel = model;
-                ctx.rpcMaxTokens = maxTokens;
+            // currently-active one. pi's `set_model` RPC requires both a
+            // provider backend and a model id — so only backend-qualified
+            // slugs (`{backend}/{model}`) can drive a mid-session switch.
+            // Bare slugs are ambiguous across pi backends and we refuse to
+            // guess: we emit a warning and keep running on the prior model
+            // rather than silently claim a switch we didn't perform.
+            let effectiveModel = ctx.rpcActiveModel ?? model;
+            let effectiveMaxTokens = ctx.rpcMaxTokens ?? maxTokens;
+            if (ctx.rpcActiveModel !== model) {
+              if (rpcProvider) {
+                const switchResult = yield* Effect.promise(() =>
+                  rpc.call("set_model", { provider: rpcProvider, modelId: rpcModel }),
+                );
+                if (switchResult.success) {
+                  ctx.rpcActiveModel = model;
+                  ctx.rpcMaxTokens = maxTokens;
+                  effectiveModel = model;
+                  effectiveMaxTokens = maxTokens;
+                } else {
+                  // Not fatal — pi keeps its current model. Warn so the
+                  // UI can reflect the discrepancy.
+                  yield* emit({
+                    ...buildEventBase({ threadId: input.threadId }),
+                    type: "runtime.warning",
+                    payload: {
+                      message: `pi set_model failed; staying on '${ctx.rpcActiveModel ?? "unknown"}': ${switchResult.error}`,
+                    },
+                  });
+                }
               } else {
-                // Not fatal — pi will keep its current model. Surface as a
-                // warning and continue so the user still gets a response.
                 yield* emit({
                   ...buildEventBase({ threadId: input.threadId }),
                   type: "runtime.warning",
                   payload: {
-                    message: `pi set_model failed: ${switchResult.error}`,
+                    message: `pi cannot switch model to bare slug '${model}'; use '{backend}/{model}' for mid-session switching. Staying on '${ctx.rpcActiveModel ?? "unknown"}'.`,
                   },
                 });
               }
@@ -1379,14 +1421,14 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
               settled: false,
               assistantTextSeen: false,
               toolItems: new Map(),
-              maxTokens: ctx.rpcMaxTokens ?? maxTokens,
+              maxTokens: effectiveMaxTokens,
             };
             ctx.activeTurn = turn;
             ctx.session = {
               ...ctx.session,
               status: "running",
               activeTurnId: turnId,
-              model,
+              model: effectiveModel,
               updatedAt: nowIso(),
             };
 
@@ -1417,9 +1459,7 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
                   },
                 });
               }
-              if (ctx.activeTurn === turn) {
-                ctx.activeTurn = undefined;
-              }
+              clearActiveTurn(ctx, turn);
             }
 
             return { threadId: input.threadId, turnId };
@@ -1541,7 +1581,7 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
           ctx.stopped = true;
           if (ctx.activeTurn) {
             killTurn(ctx.activeTurn);
-            ctx.activeTurn = undefined;
+            clearActiveTurn(ctx);
           }
           if (ctx.rpc) {
             try {
