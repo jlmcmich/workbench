@@ -108,6 +108,9 @@ export const OpenCodeSettings = Schema.Struct({
 });
 export type OpenCodeSettings = typeof OpenCodeSettings.Type;
 
+export const PiTransport = Schema.Literals(["rpc", "json"]);
+export type PiTransport = typeof PiTransport.Type;
+
 export const PiSettings = Schema.Struct({
   enabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
   binaryPath: makeBinaryPathSetting("pi"),
@@ -115,6 +118,9 @@ export const PiSettings = Schema.Struct({
   defaultModel: TrimmedString.pipe(Schema.withDecodingDefault(Effect.succeed(""))),
   favoriteModels: Schema.Array(Schema.String).pipe(Schema.withDecodingDefault(Effect.succeed([]))),
   customModels: Schema.Array(Schema.String).pipe(Schema.withDecodingDefault(Effect.succeed([]))),
+  transport: PiTransport.pipe(
+    Schema.withDecodingDefault(Effect.succeed("rpc" as const satisfies PiTransport)),
+  ),
 });
 export type PiSettings = typeof PiSettings.Type;
 
@@ -269,6 +275,7 @@ const PiSettingsPatch = Schema.Struct({
   defaultModel: Schema.optionalKey(Schema.String),
   favoriteModels: Schema.optionalKey(Schema.Array(Schema.String)),
   customModels: Schema.optionalKey(Schema.Array(Schema.String)),
+  transport: Schema.optionalKey(PiTransport),
 });
 
 export const ServerSettingsPatch = Schema.Struct({

@@ -114,6 +114,7 @@ function createBaseServerConfig(): ServerConfig {
           defaultModel: "",
           favoriteModels: [],
           customModels: [],
+          transport: "rpc",
         },
       },
     },
