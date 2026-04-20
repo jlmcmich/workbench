@@ -29,6 +29,7 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 
 import {
+  type ChatAttachment,
   RuntimeItemId,
   EventId,
   type PiTransport,
@@ -39,8 +40,10 @@ import {
   type ToolLifecycleItemType,
   TurnId,
 } from "@workbench/contracts";
-import { Effect, Layer, PubSub, Stream } from "effect";
+import { Effect, FileSystem, Layer, PubSub, Stream } from "effect";
 
+import { resolveAttachmentPath } from "../../attachmentStore.ts";
+import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import {
   ProviderAdapterProcessError,
@@ -430,6 +433,54 @@ function normalizePiTokenUsage(
   };
 }
 
+/**
+ * Bucket a pi session's `AgentMessage[]` (from `get_messages`) into
+ * Workbench `ProviderThreadTurnSnapshot[]`. A "turn" in our model is one
+ * user message plus everything pi produced before the next user message —
+ * assistant messages, tool calls / results, bash executions, custom
+ * entries. Each item is stored as-is so the orchestration layer can
+ * decide how to project it; pi's own field names (`role`, `content`,
+ * `toolCallId`, etc) are preserved.
+ *
+ * Messages that arrive before any user message (unusual, typically only
+ * happens if pi opens a session with a seeded system prompt) are placed
+ * in a synthetic bootstrap turn keyed by entry id.
+ */
+function mapPiMessagesToTurns(
+  entries: ReadonlyArray<unknown>,
+): ReadonlyArray<{ readonly id: TurnId; readonly items: ReadonlyArray<unknown> }> {
+  const turns: Array<{ id: TurnId; items: Array<unknown> }> = [];
+  let currentTurn: { id: TurnId; items: Array<unknown> } | undefined;
+
+  for (const entry of entries) {
+    if (!isRecord(entry)) continue;
+    const message = isRecord(entry.message) ? entry.message : undefined;
+    const role = asString(message?.role);
+    const entryId = asTrimmedString(entry.id);
+    const stableTurnId = entryId ? TurnId.make(`pi-turn-${entryId}`) : undefined;
+
+    if (role === "user") {
+      currentTurn = {
+        id: stableTurnId ?? TurnId.make(`pi-turn-${randomUUID()}`),
+        items: [entry],
+      };
+      turns.push(currentTurn);
+      continue;
+    }
+
+    if (!currentTurn) {
+      currentTurn = {
+        id: stableTurnId ?? TurnId.make(`pi-turn-${randomUUID()}`),
+        items: [],
+      };
+      turns.push(currentTurn);
+    }
+    currentTurn.items.push(entry);
+  }
+
+  return turns.map((turn) => ({ id: turn.id, items: turn.items }));
+}
+
 function buildEventBase(input: {
   readonly threadId: ThreadId;
   readonly turnId?: TurnId | undefined;
@@ -461,6 +512,8 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
     PiAdapter,
     Effect.gen(function* () {
       const serverSettings = yield* ServerSettingsService;
+      const serverConfig = yield* Effect.service(ServerConfig);
+      const fileSystem = yield* FileSystem.FileSystem;
       const services = yield* Effect.context<never>();
       const nativeEventLogger =
         options?.nativeEventLogger ??
@@ -506,6 +559,44 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
         PubSub.publish(runtimeEvents, event).pipe(Effect.asVoid);
       const emitPromise = (event: ProviderRuntimeEvent) =>
         emit(event).pipe(Effect.runPromiseWith(services));
+
+      /**
+       * Resolve one ChatAttachment into pi's `{type:"image", data, mimeType}`
+       * block. pi expects raw base64 (no `data:` URI prefix) and the same
+       * mime-type string the user uploaded with. See
+       * `packages/coding-agent/docs/rpc.md` §Image Content Format.
+       */
+      const resolvePiImageAttachment = (threadId: ThreadId, attachment: ChatAttachment) =>
+        Effect.gen(function* () {
+          const attachmentPath = resolveAttachmentPath({
+            attachmentsDir: serverConfig.attachmentsDir,
+            attachment,
+          });
+          if (!attachmentPath) {
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "sendTurn",
+              detail: `Invalid attachment id '${attachment.id}'.`,
+            });
+          }
+          const bytes = yield* fileSystem.readFile(attachmentPath).pipe(
+            Effect.mapError(
+              (cause) =>
+                new ProviderAdapterRequestError({
+                  provider: PROVIDER,
+                  method: "sendTurn",
+                  detail: `Failed to read attachment '${attachment.id}': ${cause instanceof Error ? cause.message : String(cause)}.`,
+                  cause,
+                }),
+            ),
+          );
+          void threadId; // reserved for future per-thread attachment scoping
+          return {
+            type: "image" as const,
+            data: Buffer.from(bytes).toString("base64"),
+            mimeType: attachment.mimeType,
+          };
+        });
 
       const writeNativeEventBestEffort = (threadId: ThreadId, payload: unknown) => {
         if (!nativeEventLogger) return;
@@ -1189,9 +1280,31 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
             return yield* new ProviderAdapterValidationError({
               provider: PROVIDER,
               operation: "sendTurn",
-              issue: "pi turns require non-empty text input (attachments not supported in MVP).",
+              issue: "pi turns require non-empty text input.",
             });
           }
+
+          // Attachments are only supported on the RPC transport — JSON mode's
+          // per-turn CLI invocation has no path to stream image bytes. In RPC
+          // mode we resolve them up front so a bad attachment blocks the
+          // spawn rather than reaching pi as a half-formed prompt.
+          const attachments = input.attachments ?? [];
+          if (attachments.length > 0 && ctx.transport !== "rpc") {
+            return yield* new ProviderAdapterValidationError({
+              provider: PROVIDER,
+              operation: "sendTurn",
+              issue:
+                "pi attachments require the rpc transport; set providers.pi.transport to 'rpc'.",
+            });
+          }
+          const piImages =
+            ctx.transport === "rpc" && attachments.length > 0
+              ? yield* Effect.forEach(
+                  attachments,
+                  (attachment) => resolvePiImageAttachment(input.threadId, attachment),
+                  { concurrency: 1 },
+                )
+              : [];
 
           const modelSelection =
             input.modelSelection?.provider === PROVIDER ? input.modelSelection : undefined;
@@ -1287,7 +1400,10 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
             // it only acknowledges receipt. Turn completion flows through
             // the notification pump (→ `turn_end`).
             const promptResult = yield* Effect.promise(() =>
-              rpc.call("prompt", { message: prompt }),
+              rpc.call("prompt", {
+                message: prompt,
+                ...(piImages.length > 0 ? { images: piImages } : {}),
+              }),
             );
             if (!promptResult.success) {
               if (!turn.settled) {
@@ -1465,7 +1581,21 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
         });
 
       const readThread: PiAdapterShape["readThread"] = (threadId) =>
-        Effect.sync(() => ({ threadId, turns: [] }));
+        Effect.gen(function* () {
+          const ctx = sessions.get(threadId);
+          if (!ctx || ctx.stopped || ctx.transport !== "rpc" || !ctx.rpc) {
+            return { threadId, turns: [] };
+          }
+
+          const result = yield* Effect.promise(() =>
+            ctx.rpc!.call<{ messages: ReadonlyArray<unknown> }>("get_messages"),
+          );
+          if (!result.success) {
+            return { threadId, turns: [] };
+          }
+          const messages = Array.isArray(result.data?.messages) ? result.data.messages : [];
+          return { threadId, turns: mapPiMessagesToTurns(messages) };
+        });
 
       const rollbackThread: PiAdapterShape["rollbackThread"] = () =>
         Effect.fail(

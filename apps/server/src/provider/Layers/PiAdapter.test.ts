@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join as pathJoin } from "node:path";
+
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   type ProviderRuntimeEvent,
@@ -10,6 +14,7 @@ import {
 import { Effect, Fiber, Layer, Option, Stream } from "effect";
 import { describe, it, vi } from "vitest";
 
+import { attachmentRelativePath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { PiAdapter } from "../Services/PiAdapter.ts";
@@ -852,6 +857,242 @@ describe("PiAdapterLive", () => {
           assert.equal(usage.payload.usage.inputTokens, 120);
           assert.equal(usage.payload.usage.outputTokens, 50);
         }).pipe(Effect.provide(makeTestLayer("rpc"))),
+      );
+    });
+
+    it("includes images array on prompt frames when attachments are present", async () => {
+      const baseDir = mkdtempSync(pathJoin(tmpdir(), "pi-attach-"));
+      // Mirror deriveServerPaths: baseDir/userdata/attachments
+      const attachmentsDir = pathJoin(baseDir, "userdata", "attachments");
+      const fs = await import("node:fs/promises");
+      await fs.mkdir(attachmentsDir, { recursive: true });
+
+      const attachment = {
+        type: "image" as const,
+        id: "thread-pi-rpc-attach-abcd1234",
+        name: "pic.png",
+        mimeType: "image/png",
+        sizeBytes: 5,
+      };
+      const filePath = pathJoin(attachmentsDir, attachmentRelativePath(attachment));
+      writeFileSync(filePath, Buffer.from("hello"));
+
+      const attachLayer = makePiAdapterLive().pipe(
+        Layer.provideMerge(ServerConfig.layerTest(process.cwd(), baseDir)),
+        Layer.provideMerge(
+          ServerSettingsService.layerTest({
+            providers: {
+              pi: {
+                binaryPath: "fake-pi",
+                defaultProvider: "",
+                customModels: [],
+                enabled: true,
+                transport: "rpc",
+              },
+            },
+          }),
+        ),
+        Layer.provideMerge(NodeServices.layer),
+      );
+
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const { rpcChildren } = installRpcSpawnMock();
+          const adapter = yield* PiAdapter;
+          const threadId = asThreadId("thread-pi-rpc-attach");
+
+          yield* adapter.startSession({
+            provider: "pi",
+            threadId,
+            runtimeMode: "full-access",
+          });
+          yield* Effect.sleep(10);
+          const child = rpcChildren[0]!;
+
+          const sendPromise = Effect.runPromise(
+            adapter
+              .sendTurn({
+                threadId,
+                input: "what's in this?",
+                attachments: [attachment],
+              })
+              .pipe(Effect.provide(attachLayer)),
+          );
+          yield* Effect.sleep(20);
+          const promptFrame = child
+            .writtenFrames()
+            .find((f) => f.type === "prompt") as {
+            readonly type: string;
+            readonly message: string;
+            readonly images?: ReadonlyArray<{ readonly type: string; readonly data: string; readonly mimeType: string }>;
+          };
+          assert.ok(promptFrame, "prompt frame should be written");
+          assert.ok(Array.isArray(promptFrame.images), "prompt frame should include images[]");
+          assert.equal(promptFrame.images?.length, 1);
+          assert.equal(promptFrame.images?.[0]?.type, "image");
+          assert.equal(promptFrame.images?.[0]?.mimeType, "image/png");
+          assert.equal(promptFrame.images?.[0]?.data, Buffer.from("hello").toString("base64"));
+
+          child.respondTo(promptFrame as Record<string, unknown>, { success: true });
+          child.notify({
+            type: "turn_end",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "done" }],
+              stopReason: "stop",
+            },
+          });
+          yield* Effect.promise(() => sendPromise);
+        }).pipe(Effect.provide(attachLayer)),
+      );
+    });
+
+    it("rejects attachments in json transport with a validation error", async () => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const spawned: FakeChildProcess[] = [];
+          spawnMock.mockReset();
+          spawnMock.mockImplementation((_bin: string, args: string[]) => {
+            const child = new FakeChildProcess();
+            if (args.includes("--list-models")) {
+              setImmediate(() => child.emit("exit", 0, null));
+              return child;
+            }
+            spawned.push(child);
+            return child;
+          });
+
+          const adapter = yield* PiAdapter;
+          const threadId = asThreadId("thread-pi-json-attach");
+          yield* adapter.startSession({
+            provider: "pi",
+            threadId,
+            runtimeMode: "full-access",
+          });
+
+          const attempt = yield* adapter
+            .sendTurn({
+              threadId,
+              input: "go",
+              attachments: [
+                {
+                  type: "image",
+                  id: "thread-pi-json-attach-xyz",
+                  name: "pic.png",
+                  mimeType: "image/png",
+                  sizeBytes: 3,
+                },
+              ],
+            })
+            .pipe(Effect.flip);
+
+          assert.equal(attempt._tag, "ProviderAdapterValidationError");
+        }).pipe(Effect.provide(PiAdapterTestLayer)),
+      );
+    });
+
+    it("readThread returns bucketed turns from pi's get_messages", async () => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const { rpcChildren } = installRpcSpawnMock();
+          const adapter = yield* PiAdapter;
+          const threadId = asThreadId("thread-pi-rpc-read");
+
+          yield* adapter.startSession({
+            provider: "pi",
+            threadId,
+            runtimeMode: "full-access",
+          });
+          yield* Effect.sleep(10);
+          const child = rpcChildren[0]!;
+
+          const readPromise = Effect.runPromise(
+            adapter.readThread(threadId).pipe(Effect.provide(makeTestLayer("rpc"))),
+          );
+          yield* Effect.sleep(5);
+          const getMessagesFrame = child
+            .writtenFrames()
+            .find((f) => f.type === "get_messages") as Record<string, unknown>;
+          assert.ok(getMessagesFrame, "expected get_messages frame");
+
+          child.respondTo(getMessagesFrame, {
+            success: true,
+            data: {
+              messages: [
+                {
+                  id: "e1",
+                  parentId: null,
+                  timestamp: "2026-04-20T00:00:01Z",
+                  message: { role: "user", content: "first prompt", timestamp: 1 },
+                },
+                {
+                  id: "e2",
+                  parentId: "e1",
+                  timestamp: "2026-04-20T00:00:02Z",
+                  message: {
+                    role: "assistant",
+                    content: [{ type: "text", text: "ok" }],
+                    timestamp: 2,
+                  },
+                },
+                {
+                  id: "e3",
+                  parentId: "e2",
+                  timestamp: "2026-04-20T00:00:03Z",
+                  message: { role: "user", content: "second prompt", timestamp: 3 },
+                },
+                {
+                  id: "e4",
+                  parentId: "e3",
+                  timestamp: "2026-04-20T00:00:04Z",
+                  message: {
+                    role: "assistant",
+                    content: [{ type: "text", text: "done" }],
+                    timestamp: 4,
+                  },
+                },
+              ],
+            },
+          });
+
+          const snapshot = yield* Effect.promise(() => readPromise);
+          assert.equal(snapshot.threadId, threadId);
+          assert.equal(snapshot.turns.length, 2);
+          assert.equal(snapshot.turns[0]?.id, "pi-turn-e1");
+          assert.equal(snapshot.turns[0]?.items.length, 2); // user + assistant
+          assert.equal(snapshot.turns[1]?.id, "pi-turn-e3");
+          assert.equal(snapshot.turns[1]?.items.length, 2);
+        }).pipe(Effect.provide(makeTestLayer("rpc"))),
+      );
+    });
+
+    it("readThread returns empty turns in json transport", async () => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const spawned: FakeChildProcess[] = [];
+          spawnMock.mockReset();
+          spawnMock.mockImplementation((_bin: string, args: string[]) => {
+            const child = new FakeChildProcess();
+            if (args.includes("--list-models")) {
+              setImmediate(() => child.emit("exit", 0, null));
+              return child;
+            }
+            spawned.push(child);
+            return child;
+          });
+
+          const adapter = yield* PiAdapter;
+          const threadId = asThreadId("thread-pi-json-read");
+          yield* adapter.startSession({
+            provider: "pi",
+            threadId,
+            runtimeMode: "full-access",
+          });
+
+          const snapshot = yield* adapter.readThread(threadId);
+          assert.equal(snapshot.threadId, threadId);
+          assert.equal(snapshot.turns.length, 0);
+        }).pipe(Effect.provide(PiAdapterTestLayer)),
       );
     });
   });
