@@ -1,16 +1,18 @@
 /**
  * PiAdapterLive — pi coding agent (`pi -p --mode json`) per-turn subprocess.
  *
- * MVP adapter: pi is spawned anew for each `sendTurn` call with `pi -p
- * --mode json --model <model> <prompt>`. stdout is parsed line-by-line as
- * NDJSON and mapped onto the canonical ProviderRuntimeEvent stream. A single
- * subprocess is tracked per-thread so it can be SIGKILL'd on interrupt or
- * session stop.
+ * pi is spawned anew for each `sendTurn` call. stdout is parsed line-by-line
+ * as NDJSON and mapped onto the canonical ProviderRuntimeEvent stream. The
+ * first line of pi's JSON output is a session header carrying a UUID; we
+ * capture it on the first turn and pass `--session <uuid>` on subsequent
+ * turns so pi restores the prior transcript and tool-call state from
+ * `~/.pi/agent/sessions/`. Extended prompt caching is enabled via
+ * `PI_CACHE_RETENTION=long` on the child env. A single subprocess is tracked
+ * per-thread so it can be SIGKILL'd on interrupt or session stop.
  *
- * Unsupported features (approvals, structured user-input, rollback, thread
- * resume) fail fast with ProviderAdapterRequestError; `readThread` returns an
- * empty snapshot since pi does not persist across our session boundary in
- * this slice.
+ * Unsupported features (approvals, structured user-input, rollback) fail
+ * fast with ProviderAdapterRequestError; `readThread` returns an empty
+ * snapshot since pi owns the transcript on its side.
  *
  * @module PiAdapterLive
  */
@@ -23,6 +25,7 @@ import {
   type ProviderRuntimeEvent,
   type ProviderSession,
   type ThreadId,
+  type ThreadTokenUsageSnapshot,
   type ToolLifecycleItemType,
   TurnId,
 } from "@workbench/contracts";
@@ -39,7 +42,13 @@ import {
 import { PiAdapter, type PiAdapterShape } from "../Services/PiAdapter.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
 
-import { DEFAULT_PI_MODEL_SLUG, normalizePiModelSlug } from "../piRuntime.ts";
+import {
+  DEFAULT_PI_MODEL_SLUG,
+  loadPiModelCatalog,
+  normalizePiModelSlug,
+  parsePiContextLabel,
+  type PiCatalogEntry,
+} from "../piRuntime.ts";
 
 const PROVIDER = "pi" as const;
 const DEFAULT_MODEL = DEFAULT_PI_MODEL_SLUG;
@@ -58,6 +67,8 @@ interface PiTurnContext {
   assistantTextSeen: boolean;
   /** Tracks in-flight tool calls so updates/completions can reuse canonical item ids. */
   readonly toolItems: Map<string, PiToolState>;
+  /** Context-window capacity for the model driving this turn, if known. */
+  readonly maxTokens: number | undefined;
 }
 
 interface PiSessionContext {
@@ -65,6 +76,19 @@ interface PiSessionContext {
   session: ProviderSession;
   activeTurn: PiTurnContext | undefined;
   stopped: boolean;
+  /**
+   * pi's session UUID, captured from the first `{"type":"session","id":...}`
+   * line of NDJSON output. Undefined until the first turn emits one; passed
+   * back via `--session <uuid>` on every subsequent turn so pi resumes the
+   * existing transcript and tool state.
+   */
+  piSessionUuid: string | undefined;
+  /**
+   * Last usage snapshot derived from `AssistantMessage.usage` on pi's
+   * `message_end`/`turn_end` events, carried forward across turns so the
+   * context-window UI reflects cumulative usage.
+   */
+  lastKnownTokenUsage: ThreadTokenUsageSnapshot | undefined;
 }
 
 interface PiToolState {
@@ -304,6 +328,51 @@ function extractErrorMessage(raw: Record<string, unknown>): string | undefined {
   return undefined;
 }
 
+function asNonNegativeNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+/**
+ * Shape pi's `AssistantMessage.usage` into our canonical snapshot. Pi emits
+ * `input`, `output`, `cacheRead`, `cacheWrite`, and `totalTokens` per message
+ * (see pi-mono `packages/ai/src/types.ts`). `inputTokens` in the snapshot
+ * sums prompt + cache-read + cache-write since that is the tokens fed to the
+ * model. `usedTokens` reflects the cumulative request volume and is capped
+ * at the model's context-window capacity when known.
+ */
+function normalizePiTokenUsage(
+  value: unknown,
+  maxTokens: number | undefined,
+): ThreadTokenUsageSnapshot | undefined {
+  if (!isRecord(value)) return undefined;
+
+  const input = asNonNegativeNumber(value.input) ?? 0;
+  const output = asNonNegativeNumber(value.output) ?? 0;
+  const cacheRead = asNonNegativeNumber(value.cacheRead) ?? 0;
+  const cacheWrite = asNonNegativeNumber(value.cacheWrite) ?? 0;
+  const inputTokens = input + cacheRead + cacheWrite;
+
+  const reportedTotal = asNonNegativeNumber(value.totalTokens);
+  const derivedTotal = inputTokens + output;
+  const totalProcessedTokens = reportedTotal && reportedTotal > 0 ? reportedTotal : derivedTotal;
+  if (totalProcessedTokens <= 0) return undefined;
+
+  const hasMax = typeof maxTokens === "number" && Number.isFinite(maxTokens) && maxTokens > 0;
+  const usedTokens = hasMax ? Math.min(totalProcessedTokens, maxTokens) : totalProcessedTokens;
+
+  return {
+    usedTokens,
+    lastUsedTokens: usedTokens,
+    ...(totalProcessedTokens > usedTokens ? { totalProcessedTokens } : {}),
+    ...(inputTokens > 0 ? { inputTokens, lastInputTokens: inputTokens } : {}),
+    ...(cacheRead + cacheWrite > 0
+      ? { cachedInputTokens: cacheRead + cacheWrite, lastCachedInputTokens: cacheRead + cacheWrite }
+      : {}),
+    ...(output > 0 ? { outputTokens: output, lastOutputTokens: output } : {}),
+    ...(hasMax ? { maxTokens } : {}),
+  };
+}
+
 function buildEventBase(input: {
   readonly threadId: ThreadId;
   readonly turnId?: TurnId | undefined;
@@ -347,6 +416,35 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
       const sessions = new Map<ThreadId, PiSessionContext>();
       const runtimeEvents = yield* PubSub.unbounded<ProviderRuntimeEvent>();
 
+      // Lazy pi catalog: populated the first time a capacity lookup is
+      // requested. The catalog rarely changes and `pi --list-models` is
+      // relatively slow, so we memoize across the adapter lifetime.
+      let modelContextWindow: Map<string, number> | undefined;
+      let modelContextWindowPromise: Promise<Map<string, number>> | undefined;
+      const resolveModelContextWindow = async (binaryPath: string): Promise<Map<string, number>> => {
+        if (modelContextWindow) return modelContextWindow;
+        if (!modelContextWindowPromise) {
+          modelContextWindowPromise = loadPiModelCatalog({ binaryPath })
+            .then((entries: ReadonlyArray<PiCatalogEntry>) => {
+              const map = new Map<string, number>();
+              for (const entry of entries) {
+                const capacity = parsePiContextLabel(entry.context);
+                if (capacity === undefined) continue;
+                map.set(entry.model, capacity);
+                map.set(`${entry.backend}/${entry.model}`, capacity);
+              }
+              modelContextWindow = map;
+              return map;
+            })
+            .catch(() => {
+              const empty = new Map<string, number>();
+              modelContextWindow = empty;
+              return empty;
+            });
+        }
+        return modelContextWindowPromise;
+      };
+
       const emit = (event: ProviderRuntimeEvent) =>
         PubSub.publish(runtimeEvents, event).pipe(Effect.asVoid);
       const emitPromise = (event: ProviderRuntimeEvent) =>
@@ -375,6 +473,22 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
           .catch(() => undefined);
       };
 
+      const emitUsageFromMessage = (
+        ctx: PiSessionContext,
+        turn: PiTurnContext,
+        message: unknown,
+      ) => {
+        if (!isRecord(message)) return;
+        const snapshot = normalizePiTokenUsage(message.usage, turn.maxTokens);
+        if (!snapshot) return;
+        ctx.lastKnownTokenUsage = snapshot;
+        void emitPromise({
+          ...buildEventBase({ threadId: ctx.threadId, turnId: turn.turnId }),
+          type: "thread.token-usage.updated",
+          payload: { usage: snapshot },
+        }).catch(() => undefined);
+      };
+
       const requireSession = (threadId: ThreadId) => {
         const ctx = sessions.get(threadId);
         if (!ctx) {
@@ -396,7 +510,13 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
 
         const kind = typeof raw.type === "string" ? raw.type : undefined;
         switch (kind) {
-          case "session":
+          case "session": {
+            const sessionUuid = asTrimmedString(raw.id);
+            if (sessionUuid && !ctx.piSessionUuid) {
+              ctx.piSessionUuid = sessionUuid;
+            }
+            return;
+          }
           case "agent_start":
           case "turn_start":
           case "agent_end":
@@ -459,6 +579,9 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
                   delta: text,
                 },
               }).catch(() => undefined);
+            }
+            if (kind === "message_end") {
+              emitUsageFromMessage(ctx, turn, raw.message);
             }
             return;
           }
@@ -635,6 +758,8 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
                 },
               }).catch(() => undefined);
             }
+
+            emitUsageFromMessage(ctx, turn, raw.message);
 
             if (turn.settled) return;
             turn.settled = true;
@@ -836,6 +961,8 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
             session,
             activeTurn: undefined,
             stopped: false,
+            piSessionUuid: undefined,
+            lastKnownTokenUsage: undefined,
           };
           sessions.set(input.threadId, ctx);
 
@@ -896,14 +1023,18 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
           const binaryPath = piSettings.binaryPath.trim().length > 0 ? piSettings.binaryPath : "pi";
 
           const turnId = TurnId.make(`pi-turn-${randomUUID()}`);
-          const args = ["-p", "--mode", "json", "--model", model, prompt];
+          const resumeArgs = ctx.piSessionUuid ? ["--session", ctx.piSessionUuid] : [];
+          const args = [...resumeArgs, "-p", "--mode", "json", "--model", model, prompt];
+
+          const capacityMap = yield* Effect.promise(() => resolveModelContextWindow(binaryPath));
+          const maxTokens = capacityMap.get(model);
 
           const child: ChildProcess = yield* Effect.try({
             try: () =>
               spawn(binaryPath, args, {
                 stdio: ["ignore", "pipe", "pipe"],
                 shell: process.platform === "win32",
-                env: process.env,
+                env: { ...process.env, PI_CACHE_RETENTION: "long" },
                 ...(ctx.session.cwd ? { cwd: ctx.session.cwd } : {}),
               }),
             catch: (cause) =>
@@ -921,6 +1052,7 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
             settled: false,
             assistantTextSeen: false,
             toolItems: new Map(),
+            maxTokens,
           };
           ctx.activeTurn = turn;
           ctx.session = {
