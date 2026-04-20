@@ -1507,6 +1507,107 @@ describe("PiAdapterLive", () => {
       );
     });
 
+    it("turn.started reports the pi-active model when a bare-slug switch is skipped", async () => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const { rpcChildren } = installRpcSpawnMock();
+          const adapter = yield* PiAdapter;
+          const threadId = asThreadId("thread-pi-rpc-turnstarted-effective");
+
+          yield* adapter.startSession({
+            provider: "pi",
+            threadId,
+            runtimeMode: "full-access",
+            modelSelection: { provider: "pi", model: "openai-codex/gpt-5.4" },
+          });
+          yield* Effect.sleep(10);
+          const child = rpcChildren[0]!;
+
+          const eventsFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 2)).pipe(
+            Effect.forkChild,
+          );
+          yield* Effect.sleep(0);
+
+          const sendPromise = Effect.runPromise(
+            adapter
+              .sendTurn({
+                threadId,
+                input: "go",
+                modelSelection: { provider: "pi", model: "claude-haiku-4-5" }, // bare
+              })
+              .pipe(Effect.provide(makeTestLayer("rpc"))),
+          );
+          yield* Effect.sleep(10);
+          const promptFrame = child.writtenFrames().find((f) => f.type === "prompt")!;
+          child.respondTo(promptFrame, { success: true });
+          child.notify({
+            type: "turn_end",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "k" }],
+              stopReason: "stop",
+            },
+          });
+          yield* Effect.promise(() => sendPromise);
+
+          const events = yield* joinEvents(eventsFiber);
+          const started = events.find((e) => e.type === "turn.started");
+          assert.ok(started);
+          if (started?.type !== "turn.started") throw new Error();
+          assert.equal(
+            started.payload.model,
+            "openai-codex/gpt-5.4",
+            "turn.started should announce the pi-active model, not the requested one",
+          );
+        }).pipe(Effect.provide(makeTestLayer("rpc"))),
+      );
+    });
+
+    it("surfaces runtime.warning and auto-cancels extension_ui_request dialogs", async () => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const { rpcChildren } = installRpcSpawnMock();
+          const adapter = yield* PiAdapter;
+          const threadId = asThreadId("thread-pi-rpc-ext-ui");
+
+          yield* adapter.startSession({
+            provider: "pi",
+            threadId,
+            runtimeMode: "full-access",
+          });
+          yield* Effect.sleep(10);
+          const child = rpcChildren[0]!;
+
+          const eventsFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 1)).pipe(
+            Effect.forkChild,
+          );
+          yield* Effect.sleep(0);
+
+          child.notify({
+            type: "extension_ui_request",
+            id: "ext-req-1",
+            method: "confirm",
+            title: "Allow?",
+            message: "Proceed?",
+          });
+          yield* Effect.sleep(10);
+
+          const events = yield* joinEvents(eventsFiber);
+          const warn = events.find((e) => e.type === "runtime.warning");
+          assert.ok(warn, "extension_ui_request should surface a runtime.warning");
+          if (warn?.type !== "runtime.warning") throw new Error();
+          assert.match(warn.payload.message, /extension requested 'confirm'/);
+
+          const cancelFrame = child
+            .writtenFrames()
+            .find((f) => f.type === "extension_ui_response");
+          assert.ok(cancelFrame, "should auto-send extension_ui_response for dialog methods");
+          assert.equal(cancelFrame?.id, "ext-req-1");
+          assert.equal(cancelFrame?.cancelled, true);
+        }).pipe(Effect.provide(makeTestLayer("rpc"))),
+      );
+    });
+
     it("readThread returns empty turns in json transport", async () => {
       await Effect.runPromise(
         Effect.gen(function* () {

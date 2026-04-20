@@ -680,6 +680,42 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
           case "plan_mode":
           case "attachment":
             return;
+          case "extension_ui_request": {
+            // Pi extensions can request interactive UI (confirm/select/input/
+            // editor) or fire-and-forget status (notify/setStatus/setWidget/
+            // setTitle/set_editor_text). The full bridge to our approval and
+            // user-input surfaces lands in Phase 2.4. Until then, surface the
+            // request as a warning so users aren't left wondering why nothing
+            // happened, and immediately answer dialog methods with a
+            // `cancelled: true` response so pi's extension doesn't block on
+            // us waiting for input we won't provide.
+            const method = asTrimmedString(raw.method) ?? "unknown";
+            const requestId = asTrimmedString(raw.id);
+            const isDialog =
+              method === "select" ||
+              method === "confirm" ||
+              method === "input" ||
+              method === "editor";
+            void emitPromise({
+              ...buildEventBase({ threadId: ctx.threadId }),
+              type: "runtime.warning",
+              payload: {
+                message: `pi extension requested '${method}'; this transport doesn't bridge extension UI yet (Phase 2.4). The request was auto-cancelled.`,
+              },
+            }).catch(() => undefined);
+            if (isDialog && requestId && ctx.rpc) {
+              try {
+                ctx.rpc.send({
+                  type: "extension_ui_response",
+                  id: requestId,
+                  cancelled: true,
+                });
+              } catch {
+                // rpc might already be torn down — pi's own timeout handles it.
+              }
+            }
+            return;
+          }
         }
 
         // Every other event is turn-scoped. If pi emits one when no turn is
@@ -1531,7 +1567,12 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
             yield* emit({
               ...buildEventBase({ threadId: input.threadId, turnId }),
               type: "turn.started",
-              payload: { model },
+              // Emit the model pi is actually running, not the one the user
+              // asked for. These can diverge when set_model fails or the
+              // slug is bare (see runtime.warning above) — in that case the
+              // UI would otherwise claim the turn uses a model pi never
+              // switched to.
+              payload: { model: effectiveModel },
             });
 
             // Fire-and-forget: we don't await the prompt response because
