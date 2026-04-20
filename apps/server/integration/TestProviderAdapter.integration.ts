@@ -472,6 +472,9 @@ export const makeTestProviderAdapterHarness = (options?: MakeTestProviderAdapter
         sessions.clear();
       });
 
+    const queueMessage: ProviderAdapterShape<ProviderAdapterError>["queueMessage"] = () =>
+      Effect.void;
+
     const adapter: ProviderAdapterShape<ProviderAdapterError> = {
       provider,
       capabilities: {
@@ -480,6 +483,7 @@ export const makeTestProviderAdapterHarness = (options?: MakeTestProviderAdapter
       startSession,
       sendTurn,
       interruptTurn,
+      queueMessage,
       respondToRequest,
       respondToUserInput,
       stopSession,

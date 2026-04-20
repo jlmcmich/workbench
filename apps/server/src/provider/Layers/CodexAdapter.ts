@@ -1610,6 +1610,15 @@ const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
 
   yield* Effect.acquireRelease(registerListener(), unregisterListener);
 
+  const queueMessage: CodexAdapterShape["queueMessage"] = () =>
+    Effect.fail(
+      new ProviderAdapterRequestError({
+        provider: PROVIDER,
+        method: "queueMessage",
+        detail: "Codex does not support message queueing.",
+      }),
+    );
+
   return {
     provider: PROVIDER,
     capabilities: {
@@ -1618,6 +1627,7 @@ const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     startSession,
     sendTurn,
     interruptTurn,
+    queueMessage,
     readThread,
     rollbackThread,
     respondToRequest,

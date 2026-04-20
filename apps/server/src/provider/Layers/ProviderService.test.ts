@@ -174,6 +174,8 @@ function makeFakeCodexAdapter(provider: ProviderKind = "codex") {
       }),
   );
 
+  const queueMessage = vi.fn((): Effect.Effect<void, ProviderAdapterError> => Effect.void);
+
   const adapter: ProviderAdapterShape<ProviderAdapterError> = {
     provider,
     capabilities: {
@@ -182,6 +184,7 @@ function makeFakeCodexAdapter(provider: ProviderKind = "codex") {
     startSession,
     sendTurn,
     interruptTurn,
+    queueMessage,
     respondToRequest,
     respondToUserInput,
     stopSession,

@@ -1224,6 +1224,155 @@ describe("PiAdapterLive", () => {
       );
     });
 
+    it("queueMessage(steer) writes a steer frame while a turn is in flight", async () => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const { rpcChildren } = installRpcSpawnMock();
+          const adapter = yield* PiAdapter;
+          const threadId = asThreadId("thread-pi-rpc-steer");
+
+          yield* adapter.startSession({
+            provider: "pi",
+            threadId,
+            runtimeMode: "full-access",
+          });
+          yield* Effect.sleep(10);
+          const child = rpcChildren[0]!;
+
+          // Start a turn and leave it in flight.
+          const turnPromise = Effect.runPromise(
+            adapter.sendTurn({ threadId, input: "run" }).pipe(Effect.provide(makeTestLayer("rpc"))),
+          );
+          yield* Effect.sleep(10);
+          const promptFrame = child.writtenFrames().find((f) => f.type === "prompt")!;
+          child.respondTo(promptFrame, { success: true });
+
+          // Now queue a steer mid-turn.
+          const steerPromise = Effect.runPromise(
+            adapter
+              .queueMessage(threadId, "steer", { threadId, input: "focus on errors" })
+              .pipe(Effect.provide(makeTestLayer("rpc"))),
+          );
+          yield* Effect.sleep(10);
+          const steerFrame = child.writtenFrames().find((f) => f.type === "steer")!;
+          assert.ok(steerFrame, "steer frame should be written");
+          assert.equal(steerFrame.message, "focus on errors");
+          child.respondTo(steerFrame, { success: true });
+          yield* Effect.promise(() => steerPromise);
+
+          // And a follow-up.
+          const followPromise = Effect.runPromise(
+            adapter
+              .queueMessage(threadId, "followUp", { threadId, input: "then summarize" })
+              .pipe(Effect.provide(makeTestLayer("rpc"))),
+          );
+          yield* Effect.sleep(10);
+          const followFrame = child.writtenFrames().find((f) => f.type === "follow_up")!;
+          assert.ok(followFrame, "follow_up frame should be written");
+          assert.equal(followFrame.message, "then summarize");
+          child.respondTo(followFrame, { success: true });
+          yield* Effect.promise(() => followPromise);
+
+          // Settle the turn so fibers drain.
+          child.notify({
+            type: "turn_end",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "done" }],
+              stopReason: "stop",
+            },
+          });
+          yield* Effect.promise(() => turnPromise);
+        }).pipe(Effect.provide(makeTestLayer("rpc"))),
+      );
+    });
+
+    it("maps pi queue_update notifications to turn.queue.updated events", async () => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const { rpcChildren } = installRpcSpawnMock();
+          const adapter = yield* PiAdapter;
+          const threadId = asThreadId("thread-pi-rpc-queue-update");
+
+          yield* adapter.startSession({
+            provider: "pi",
+            threadId,
+            runtimeMode: "full-access",
+          });
+          yield* Effect.sleep(10);
+          const child = rpcChildren[0]!;
+
+          // Subscribe before the turn so we capture turn.started + queue events.
+          const eventsFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 3)).pipe(
+            Effect.forkChild,
+          );
+          yield* Effect.sleep(0);
+
+          const turnPromise = Effect.runPromise(
+            adapter.sendTurn({ threadId, input: "long task" }).pipe(Effect.provide(makeTestLayer("rpc"))),
+          );
+          yield* Effect.sleep(10);
+          const promptFrame = child.writtenFrames().find((f) => f.type === "prompt")!;
+          child.respondTo(promptFrame, { success: true });
+
+          child.notify({
+            type: "queue_update",
+            steering: ["focus on errors"],
+            followUp: ["then summarize"],
+          });
+
+          child.notify({
+            type: "turn_end",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "done" }],
+              stopReason: "stop",
+            },
+          });
+          yield* Effect.promise(() => turnPromise);
+
+          const events = yield* joinEvents(eventsFiber);
+          const queueEvent = events.find((e) => e.type === "turn.queue.updated");
+          assert.ok(queueEvent, "expected turn.queue.updated event");
+          if (queueEvent?.type !== "turn.queue.updated") throw new Error();
+          assert.deepEqual(queueEvent.payload.steering, ["focus on errors"]);
+          assert.deepEqual(queueEvent.payload.followUp, ["then summarize"]);
+        }).pipe(Effect.provide(makeTestLayer("rpc"))),
+      );
+    });
+
+    it("queueMessage rejects when no turn is active", async () => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          installRpcSpawnMock();
+          const adapter = yield* PiAdapter;
+          const threadId = asThreadId("thread-pi-rpc-queue-no-turn");
+
+          yield* adapter.startSession({
+            provider: "pi",
+            threadId,
+            runtimeMode: "full-access",
+          });
+          yield* Effect.sleep(10);
+
+          const attempt = yield* adapter
+            .queueMessage(threadId, "steer", { threadId, input: "hi" })
+            .pipe(Effect.flip);
+          assert.equal(attempt._tag, "ProviderAdapterValidationError");
+        }).pipe(Effect.provide(makeTestLayer("rpc"))),
+      );
+    });
+
+    it("declares sessionModelSwitch in-session capability", async () => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          installRpcSpawnMock();
+          const adapter = yield* PiAdapter;
+          assert.equal(adapter.capabilities.sessionModelSwitch, "in-session");
+        }).pipe(Effect.provide(makeTestLayer("rpc"))),
+      );
+    });
+
     it("readThread returns empty turns in json transport", async () => {
       await Effect.runPromise(
         Effect.gen(function* () {

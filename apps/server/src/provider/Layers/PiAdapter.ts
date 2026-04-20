@@ -681,6 +681,32 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
         // active (e.g. during a racing abort, or from an extension after
         // turn_end), drop it quietly rather than crash.
         if (!turn) return;
+        if (kind === "queue_update") {
+          const steeringList = Array.isArray(raw.steering)
+            ? raw.steering.flatMap((entry) =>
+                typeof entry === "string"
+                  ? [entry]
+                  : isRecord(entry) && typeof entry.text === "string"
+                    ? [entry.text]
+                    : [],
+              )
+            : [];
+          const followUpList = Array.isArray(raw.followUp)
+            ? raw.followUp.flatMap((entry) =>
+                typeof entry === "string"
+                  ? [entry]
+                  : isRecord(entry) && typeof entry.text === "string"
+                    ? [entry.text]
+                    : [],
+              )
+            : [];
+          void emitPromise({
+            ...buildEventBase({ threadId: ctx.threadId, turnId: turn.turnId }),
+            type: "turn.queue.updated",
+            payload: { steering: steeringList, followUp: followUpList },
+          }).catch(() => undefined);
+          return;
+        }
         switch (kind) {
 
           case "plan":
@@ -1530,16 +1556,24 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
           if (ctx.transport === "rpc" && ctx.rpc) {
             // Graceful abort: pi responds with a turn_end whose stopReason
             // reflects the cancellation, which our notification pump maps
-            // to `turn.completed{state:"interrupted"}`. If the abort RPC
-            // fails (e.g. pi hung) we fall back to SIGKILL on the rpc child.
-            const abortResult = yield* Effect.promise(() => ctx.rpc!.call("abort"));
-            if (!abortResult.success) {
-              if (ctx.rpcChild && !ctx.rpcChild.killed) {
-                try {
-                  ctx.rpcChild.kill("SIGKILL");
-                } catch {
-                  // ignore
-                }
+            // to `turn.completed{state:"interrupted"}`. We cap the wait at
+            // 2s so a hung pi process can't stall our session; SIGKILL is
+            // the last-resort fallback on either timeout or explicit
+            // failure.
+            const abortOutcome = yield* Effect.promise(() =>
+              Promise.race([
+                ctx.rpc!.call("abort"),
+                new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 2_000)),
+              ]),
+            );
+            const abortFailed =
+              abortOutcome === "timeout" ||
+              (typeof abortOutcome === "object" && abortOutcome.success === false);
+            if (abortFailed && ctx.rpcChild && !ctx.rpcChild.killed) {
+              try {
+                ctx.rpcChild.kill("SIGKILL");
+              } catch {
+                // ignore
               }
             }
             return;
@@ -1548,6 +1582,58 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
           // JSON transport: kill the per-turn child; exit handler emits
           // turn.completed{state:"interrupted"}.
           killTurn(active);
+        });
+
+      const queueMessage: PiAdapterShape["queueMessage"] = (threadId, kind, input) =>
+        Effect.gen(function* () {
+          const ctx = yield* requireSession(threadId);
+          if (ctx.transport !== "rpc" || !ctx.rpc) {
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "queueMessage",
+              detail: "pi queueing requires the rpc transport.",
+            });
+          }
+          if (!ctx.activeTurn) {
+            return yield* new ProviderAdapterValidationError({
+              provider: PROVIDER,
+              operation: "queueMessage",
+              issue: "No pi turn is in flight; use sendTurn to start one.",
+            });
+          }
+          const message = input.input?.trim();
+          if (!message || message.length === 0) {
+            return yield* new ProviderAdapterValidationError({
+              provider: PROVIDER,
+              operation: "queueMessage",
+              issue: "Queued pi messages require non-empty text input.",
+            });
+          }
+
+          const attachments = input.attachments ?? [];
+          const piImages =
+            attachments.length > 0
+              ? yield* Effect.forEach(
+                  attachments,
+                  (attachment) => resolvePiImageAttachment(threadId, attachment),
+                  { concurrency: 1 },
+                )
+              : [];
+
+          const rpcMethod = kind === "steer" ? "steer" : "follow_up";
+          const result = yield* Effect.promise(() =>
+            ctx.rpc!.call(rpcMethod, {
+              message,
+              ...(piImages.length > 0 ? { images: piImages } : {}),
+            }),
+          );
+          if (!result.success) {
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "queueMessage",
+              detail: `pi ${rpcMethod} failed: ${result.error}`,
+            });
+          }
         });
 
       const respondToRequest: PiAdapterShape["respondToRequest"] = () =>
@@ -1658,10 +1744,15 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
 
       return {
         provider: PROVIDER,
-        capabilities: { sessionModelSwitch: "unsupported" },
+        // pi supports mid-session model swaps via the RPC `set_model` command;
+        // JSON-mode falls back to per-turn `--model` flags on each spawn.
+        // Both paths respect the composer's per-turn model selection, so the
+        // capability is declared "in-session" at the adapter level.
+        capabilities: { sessionModelSwitch: "in-session" },
         startSession,
         sendTurn,
         interruptTurn,
+        queueMessage,
         respondToRequest,
         respondToUserInput,
         stopSession,

@@ -25,6 +25,15 @@ import type { Stream } from "effect";
 
 export type ProviderSessionModelSwitchMode = "in-session" | "unsupported";
 
+/**
+ * Verb for a queued prompt addition relative to the currently-running turn.
+ *
+ * - `steer`: nudge the in-flight turn mid-flight (pi's `steer` RPC).
+ * - `followUp`: enqueue a message to run after the current turn completes
+ *   (pi's `follow_up` RPC).
+ */
+export type ProviderQueueMessageKind = "steer" | "followUp";
+
 export interface ProviderAdapterCapabilities {
   /**
    * Declares whether changing the model on an existing session is supported.
@@ -67,6 +76,20 @@ export interface ProviderAdapterShape<TError> {
    * Interrupt an active turn.
    */
   readonly interruptTurn: (threadId: ThreadId, turnId?: TurnId) => Effect.Effect<void, TError>;
+
+  /**
+   * Enqueue a prompt against an in-flight turn rather than starting a new
+   * one. Providers that have native queueing semantics (pi's `steer` and
+   * `follow_up` RPCs) accept this; others return a request error.
+   *
+   * Callers decide `kind` explicitly — there's no auto-routing, so the UI
+   * can present "steer current" vs "queue follow-up" as distinct actions.
+   */
+  readonly queueMessage: (
+    threadId: ThreadId,
+    kind: ProviderQueueMessageKind,
+    input: ProviderSendTurnInput,
+  ) => Effect.Effect<void, TError>;
 
   /**
    * Respond to an interactive approval request.
