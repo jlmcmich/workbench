@@ -42,6 +42,27 @@ class FakeChildProcess extends EventEmitter {
   }
 }
 
+/**
+ * Default spawn mock: collects every pi subprocess spawn, but short-circuits
+ * the catalog probe (`pi --list-models`) so tests don't hang waiting for a
+ * stdout/exit we'd never emit. The first-turn `sendTurn` subprocess lands as
+ * `turnChildren[0]`, matching the pre-catalog test shape.
+ */
+function installPiSpawnMock(): { readonly turnChildren: FakeChildProcess[] } {
+  const turnChildren: FakeChildProcess[] = [];
+  spawnMock.mockReset();
+  spawnMock.mockImplementation((_bin: string, args: string[]) => {
+    const child = new FakeChildProcess();
+    if (args.includes("--list-models")) {
+      setImmediate(() => child.emit("exit", 0, null));
+      return child;
+    }
+    turnChildren.push(child);
+    return child;
+  });
+  return { turnChildren };
+}
+
 const asThreadId = (value: string): ThreadId => ThreadId.make(value);
 function emitJsonLine(child: FakeChildProcess, payload: unknown): void {
   child.stdout.emit("data", `${JSON.stringify(payload)}\n`);
@@ -102,8 +123,12 @@ describe("PiAdapterLive", () => {
       Effect.gen(function* () {
         const spawned: FakeChildProcess[] = [];
         spawnMock.mockReset();
-        spawnMock.mockImplementation(() => {
+        spawnMock.mockImplementation((_bin: string, args: string[]) => {
           const child = new FakeChildProcess();
+          if (args.includes("--list-models")) {
+            setImmediate(() => child.emit("exit", 0, null));
+            return child;
+          }
           spawned.push(child);
           return child;
         });
@@ -211,8 +236,12 @@ describe("PiAdapterLive", () => {
       Effect.gen(function* () {
         const spawned: FakeChildProcess[] = [];
         spawnMock.mockReset();
-        spawnMock.mockImplementation(() => {
+        spawnMock.mockImplementation((_bin: string, args: string[]) => {
           const child = new FakeChildProcess();
+          if (args.includes("--list-models")) {
+            setImmediate(() => child.emit("exit", 0, null));
+            return child;
+          }
           spawned.push(child);
           return child;
         });
@@ -283,8 +312,12 @@ describe("PiAdapterLive", () => {
       Effect.gen(function* () {
         const spawned: FakeChildProcess[] = [];
         spawnMock.mockReset();
-        spawnMock.mockImplementation(() => {
+        spawnMock.mockImplementation((_bin: string, args: string[]) => {
           const child = new FakeChildProcess();
+          if (args.includes("--list-models")) {
+            setImmediate(() => child.emit("exit", 0, null));
+            return child;
+          }
           spawned.push(child);
           return child;
         });
@@ -379,8 +412,12 @@ describe("PiAdapterLive", () => {
       Effect.gen(function* () {
         const spawned: FakeChildProcess[] = [];
         spawnMock.mockReset();
-        spawnMock.mockImplementation(() => {
+        spawnMock.mockImplementation((_bin: string, args: string[]) => {
           const child = new FakeChildProcess();
+          if (args.includes("--list-models")) {
+            setImmediate(() => child.emit("exit", 0, null));
+            return child;
+          }
           spawned.push(child);
           return child;
         });
@@ -441,6 +478,143 @@ describe("PiAdapterLive", () => {
         const started = expectToolItem(events[1], "item.started", "dynamic_tool_call");
         const completed = expectToolItem(events[2], "item.completed", "dynamic_tool_call");
         assert.equal(started.itemId, completed.itemId);
+      }).pipe(Effect.provide(PiAdapterTestLayer)),
+    );
+  });
+
+  it("captures pi's session uuid and passes --session on subsequent turns", async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const spawned: FakeChildProcess[] = [];
+        spawnMock.mockReset();
+        spawnMock.mockImplementation((_bin: string, args: string[]) => {
+          const child = new FakeChildProcess();
+          if (args.includes("--list-models")) {
+            setImmediate(() => child.emit("exit", 0, null));
+            return child;
+          }
+          spawned.push(child);
+          return child;
+        });
+
+        const adapter = yield* PiAdapter;
+        const threadId = asThreadId("thread-pi-resume");
+
+        yield* adapter.startSession({
+          provider: "pi",
+          threadId,
+          runtimeMode: "full-access",
+        });
+
+        yield* adapter.sendTurn({ threadId, input: "first" });
+        const firstChild = spawned[0];
+        assert.ok(firstChild);
+
+        emitJsonLine(firstChild, {
+          type: "session",
+          version: 3,
+          id: "pi-uuid-123",
+          timestamp: "2026-04-19T00:00:00Z",
+          cwd: "/tmp",
+        });
+        emitJsonLine(firstChild, {
+          type: "turn_end",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "ok" }],
+            stopReason: "stop",
+          },
+        });
+        firstChild.emit("exit", 0, null);
+        yield* Effect.sleep(10);
+
+        yield* adapter.sendTurn({ threadId, input: "second" });
+        const secondChild = spawned[1];
+        assert.ok(secondChild);
+
+        emitJsonLine(secondChild, {
+          type: "turn_end",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "ok2" }],
+            stopReason: "stop",
+          },
+        });
+        secondChild.emit("exit", 0, null);
+
+        const turnCalls = (
+          spawnMock.mock.calls as Array<[string, string[], { env: Record<string, string> }]>
+        ).filter(([, args]) => !args.includes("--list-models"));
+
+        const [firstBin, firstCallArgs, firstOpts] = turnCalls[0] ?? [];
+        assert.equal(firstBin, "fake-pi");
+        assert.ok(firstCallArgs);
+        assert.equal(firstCallArgs.includes("--session"), false);
+        assert.equal(firstCallArgs[0], "-p");
+        assert.equal(firstOpts?.env.PI_CACHE_RETENTION, "long");
+
+        const [, secondCallArgs, secondOpts] = turnCalls[1] ?? [];
+        assert.ok(secondCallArgs);
+        assert.equal(secondCallArgs[0], "--session");
+        assert.equal(secondCallArgs[1], "pi-uuid-123");
+        assert.equal(secondOpts?.env.PI_CACHE_RETENTION, "long");
+      }).pipe(Effect.provide(PiAdapterTestLayer)),
+    );
+  });
+
+  it("emits thread.token-usage.updated from pi's message.usage", async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const { turnChildren } = installPiSpawnMock();
+
+        const adapter = yield* PiAdapter;
+        const threadId = asThreadId("thread-pi-usage");
+
+        yield* adapter.startSession({
+          provider: "pi",
+          threadId,
+          runtimeMode: "full-access",
+        });
+
+        const eventsFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 4)).pipe(
+          Effect.forkChild,
+        );
+        yield* Effect.sleep(0);
+
+        yield* adapter.sendTurn({ threadId, input: "Summarize the repo." });
+        const child = turnChildren[0];
+        assert.ok(child);
+
+        emitJsonLine(child, {
+          type: "turn_end",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "done" }],
+            stopReason: "stop",
+            usage: {
+              input: 1234,
+              output: 567,
+              cacheRead: 200,
+              cacheWrite: 0,
+              totalTokens: 2001,
+            },
+          },
+        });
+        child.emit("exit", 0, null);
+
+        const events = yield* joinEvents(eventsFiber);
+        const usageEvent = events.find((e) => e.type === "thread.token-usage.updated");
+        assert.ok(usageEvent, "expected a thread.token-usage.updated event");
+        if (usageEvent?.type !== "thread.token-usage.updated") {
+          throw new Error("expected thread.token-usage.updated");
+        }
+        const { usage } = usageEvent.payload;
+        assert.equal(usage.usedTokens, 2001);
+        assert.equal(usage.lastUsedTokens, 2001);
+        assert.equal(usage.inputTokens, 1434);
+        assert.equal(usage.lastInputTokens, 1434);
+        assert.equal(usage.cachedInputTokens, 200);
+        assert.equal(usage.outputTokens, 567);
       }).pipe(Effect.provide(PiAdapterTestLayer)),
     );
   });

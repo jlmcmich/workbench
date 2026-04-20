@@ -194,6 +194,22 @@ export async function loadPiModelCatalog(input: {
 }
 
 /**
+ * Convert pi's compact context-window label ("200K", "1M", "32k") into a
+ * numeric token count. Returns undefined for unrecognised inputs so callers
+ * can fall back gracefully.
+ */
+export function parsePiContextLabel(label: string): number | undefined {
+  const match = label.trim().match(/^(\d+(?:\.\d+)?)([kKmM]?)$/);
+  if (!match) return undefined;
+  const [, digits, suffix] = match;
+  if (!digits) return undefined;
+  const value = Number.parseFloat(digits);
+  if (!Number.isFinite(value) || value <= 0) return undefined;
+  const multiplier = suffix === "m" || suffix === "M" ? 1_000_000 : suffix ? 1_000 : 1;
+  return Math.round(value * multiplier);
+}
+
+/**
  * Convert a parsed pi catalog into ServerProviderModel entries for the
  * provider snapshot. Both slug and name are `{backend}/{model}` so pi can
  * route turns to the right backend — bare model slugs are ambiguous across
