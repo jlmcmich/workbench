@@ -104,6 +104,11 @@ interface PiSessionContext {
    */
   piSessionUuid: string | undefined;
   /**
+   * Absolute path to pi's session JSONL file. Surfaced via `get_state` on
+   * RPC bootstrap so future phases can call `switch_session` on restart.
+   */
+  piSessionFile: string | undefined;
+  /**
    * Last usage snapshot derived from `AssistantMessage.usage` on pi's
    * `message_end`/`turn_end` events, carried forward across turns so the
    * context-window UI reflects cumulative usage.
@@ -1245,6 +1250,7 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
             stopped: false,
             transport,
             piSessionUuid: undefined,
+            piSessionFile: undefined,
             lastKnownTokenUsage: undefined,
             rpc: undefined,
             rpcChild: undefined,
@@ -1284,6 +1290,70 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
             ctx.rpcActiveModel = normalizedModel;
             ctx.rpcMaxTokens = capacityMap.get(rpcModel) ?? capacityMap.get(normalizedModel);
             attachSessionListeners(ctx);
+
+            // Sync adapter state with pi's own view. Pi persists `isStreaming`
+            // in its session file, so reconnecting to a dormant thread where
+            // a previous turn queued a follow_up — or where the prior child
+            // exited mid-turn — can land us with a busy pi even though our
+            // activeTurn is undefined. Without this sync the next sendTurn
+            // would call `prompt` and pi would reject with "Agent is already
+            // processing". A 2s timeout keeps startSession snappy even if pi
+            // hangs on the state call.
+            const stateProbe = yield* Effect.promise(() =>
+              Promise.race([
+                ctx.rpc!.call<{
+                  sessionId?: string;
+                  sessionFile?: string;
+                  isStreaming?: boolean;
+                  model?: { provider?: string; modelId?: string };
+                }>("get_state"),
+                new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 2_000)),
+              ]),
+            );
+            if (stateProbe !== "timeout" && stateProbe.success) {
+              const state = stateProbe.data ?? {};
+              if (typeof state.sessionId === "string") {
+                ctx.piSessionUuid = state.sessionId;
+              }
+              if (typeof state.sessionFile === "string") {
+                ctx.piSessionFile = state.sessionFile;
+              }
+              if (state.isStreaming === true) {
+                // pi is mid-turn from a prior session. Stand up a placeholder
+                // turn so our sendTurn guard (and the UI's running state) see
+                // the same reality pi sees; the next turn_end notification
+                // clears it through the existing handlePiEvent path.
+                const resumedTurnId = TurnId.make(`pi-turn-resumed-${randomUUID()}`);
+                const resumedTurn: PiTurnContext = {
+                  turnId: resumedTurnId,
+                  child: undefined,
+                  settled: false,
+                  assistantTextSeen: false,
+                  toolItems: new Map(),
+                  maxTokens: ctx.rpcMaxTokens,
+                };
+                ctx.activeTurn = resumedTurn;
+                ctx.session = {
+                  ...ctx.session,
+                  status: "running",
+                  activeTurnId: resumedTurnId,
+                  updatedAt: nowIso(),
+                };
+                yield* emit({
+                  ...buildEventBase({ threadId: input.threadId, turnId: resumedTurnId }),
+                  type: "turn.started",
+                  payload: { model: normalizedModel },
+                });
+                yield* emit({
+                  ...buildEventBase({ threadId: input.threadId }),
+                  type: "runtime.warning",
+                  payload: {
+                    message:
+                      "pi was already processing when we reconnected; resuming the in-flight turn.",
+                  },
+                });
+              }
+            }
           }
 
           sessions.set(input.threadId, ctx);
@@ -1474,6 +1544,18 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
               }),
             );
             if (!promptResult.success) {
+              // pi can reject prompt calls with "Agent is already processing"
+              // when its session file carried a pending turn from a prior
+              // run (see Phase 2.3b). Our get_state bootstrap usually
+              // handles this, but pi state can also advance between startup
+              // and the user's first send. Rewrite the error so the UI can
+              // suggest queueMessage("steer"|"followUp") instead of showing
+              // pi's raw text.
+              const errText = promptResult.error;
+              const busy = /already processing/i.test(errText);
+              const detail = busy
+                ? "pi is already processing a turn on this thread — use queueMessage('steer') to nudge it or queueMessage('followUp') to run your message after it finishes."
+                : `pi prompt failed: ${errText}`;
               if (!turn.settled) {
                 turn.settled = true;
                 yield* emit({
@@ -1481,11 +1563,33 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
                   type: "turn.completed",
                   payload: {
                     state: "failed",
-                    errorMessage: `pi prompt failed: ${promptResult.error}`,
+                    errorMessage: detail,
                   },
                 });
               }
               clearActiveTurn(ctx, turn);
+
+              // If pi says it's busy, our state disagreed — resync now so
+              // the next sendTurn hits the local guard instead of another
+              // round-trip to pi. We do this opportunistically rather than
+              // on every failure.
+              if (busy) {
+                const resumedTurnId = TurnId.make(`pi-turn-resumed-${randomUUID()}`);
+                ctx.activeTurn = {
+                  turnId: resumedTurnId,
+                  child: undefined,
+                  settled: false,
+                  assistantTextSeen: false,
+                  toolItems: new Map(),
+                  maxTokens: ctx.rpcMaxTokens,
+                };
+                ctx.session = {
+                  ...ctx.session,
+                  status: "running",
+                  activeTurnId: resumedTurnId,
+                  updatedAt: nowIso(),
+                };
+              }
             }
 
             return { threadId: input.threadId, turnId };

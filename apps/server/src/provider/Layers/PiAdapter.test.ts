@@ -61,9 +61,53 @@ class FakeWritable extends EventEmitter {
 class FakeRpcChildProcess extends EventEmitter {
   readonly stdout = new FakeReadable();
   readonly stderr = new FakeReadable();
-  readonly stdin = new FakeWritable();
+  readonly stdin: FakeWritable;
   killed = false;
   exitCode: number | null = null;
+  /** Canned get_state response — individual tests can mutate via configureState. */
+  private stateResponse: {
+    readonly sessionId?: string;
+    readonly sessionFile?: string;
+    readonly isStreaming?: boolean;
+  } = { isStreaming: false };
+
+  constructor() {
+    super();
+    this.stdin = new FakeWritable();
+    // Intercept writes so we can auto-respond to bootstrap frames (get_state)
+    // without every test having to drive that handshake. Individual tests
+    // still observe the frame via writtenFrames().
+    const originalWrite = this.stdin.write.bind(this.stdin);
+    this.stdin.write = (chunk: string | Uint8Array) => {
+      const result = originalWrite(chunk);
+      const text = typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
+      for (const line of text.split("\n")) {
+        if (line.trim().length === 0) continue;
+        try {
+          const frame = JSON.parse(line) as { type?: string; id?: string };
+          if (frame.type === "get_state" && typeof frame.id === "string") {
+            setImmediate(() =>
+              this.stdout.emit(
+                "data",
+                `${JSON.stringify({ type: "response", command: "get_state", id: frame.id, success: true, data: this.stateResponse })}\n`,
+              ),
+            );
+          }
+        } catch {
+          // ignore — tests may write malformed frames intentionally
+        }
+      }
+      return result;
+    };
+  }
+
+  configureState(state: {
+    readonly sessionId?: string;
+    readonly sessionFile?: string;
+    readonly isStreaming?: boolean;
+  }): void {
+    this.stateResponse = state;
+  }
 
   kill(_signal?: NodeJS.Signals): boolean {
     this.killed = true;
@@ -1369,6 +1413,96 @@ describe("PiAdapterLive", () => {
           installRpcSpawnMock();
           const adapter = yield* PiAdapter;
           assert.equal(adapter.capabilities.sessionModelSwitch, "in-session");
+        }).pipe(Effect.provide(makeTestLayer("rpc"))),
+      );
+    });
+
+    it("synthesizes an active turn when pi reports isStreaming on reconnect", async () => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const rpcChildren: FakeRpcChildProcess[] = [];
+          spawnMock.mockReset();
+          spawnMock.mockImplementation((_bin: string, args: string[]) => {
+            if (args.includes("--list-models")) {
+              const catalog = new FakeChildProcess();
+              setImmediate(() => catalog.emit("exit", 0, null));
+              return catalog;
+            }
+            const child = new FakeRpcChildProcess();
+            child.configureState({
+              sessionId: "pi-sess-abcd",
+              sessionFile: "/tmp/pi-sessions/abcd.jsonl",
+              isStreaming: true,
+            });
+            rpcChildren.push(child);
+            return child;
+          });
+
+          const adapter = yield* PiAdapter;
+          const threadId = asThreadId("thread-pi-rpc-resumed");
+
+          yield* adapter.startSession({
+            provider: "pi",
+            threadId,
+            runtimeMode: "full-access",
+          });
+          yield* Effect.sleep(20); // allow get_state round-trip
+
+          const sessions = yield* adapter.listSessions();
+          const session = sessions.find((s) => s.threadId === threadId)!;
+          assert.equal(
+            session.status,
+            "running",
+            "session should be running since pi is already streaming",
+          );
+          assert.ok(session.activeTurnId, "a placeholder turn should be active");
+
+          // Next sendTurn should hit our local guard (cleaner than pi's cryptic error).
+          const attempt = yield* adapter
+            .sendTurn({ threadId, input: "too soon" })
+            .pipe(Effect.flip);
+          assert.equal(attempt._tag, "ProviderAdapterRequestError");
+        }).pipe(Effect.provide(makeTestLayer("rpc"))),
+      );
+    });
+
+    it("translates pi 'already processing' error into an actionable message", async () => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const { rpcChildren } = installRpcSpawnMock();
+          const adapter = yield* PiAdapter;
+          const threadId = asThreadId("thread-pi-rpc-already-processing");
+
+          yield* adapter.startSession({
+            provider: "pi",
+            threadId,
+            runtimeMode: "full-access",
+          });
+          yield* Effect.sleep(10);
+          const child = rpcChildren[0]!;
+
+          const sendPromise = Effect.runPromise(
+            adapter.sendTurn({ threadId, input: "hi" }).pipe(Effect.provide(makeTestLayer("rpc"))),
+          );
+          yield* Effect.sleep(10);
+          const promptFrame = child.writtenFrames().find((f) => f.type === "prompt")!;
+          // Pi rejects with its real error string.
+          child.respondTo(promptFrame, {
+            success: false,
+            error: "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
+          });
+          yield* Effect.promise(() => sendPromise);
+
+          // Next sendTurn should rebound off our guard (we synthesized an activeTurn).
+          const nextAttempt = yield* adapter
+            .sendTurn({ threadId, input: "retry" })
+            .pipe(Effect.flip);
+          assert.equal(nextAttempt._tag, "ProviderAdapterRequestError");
+          assert.match(
+            (nextAttempt as { detail: string }).detail,
+            /in flight/i,
+            "second sendTurn should be blocked by the post-error state sync",
+          );
         }).pipe(Effect.provide(makeTestLayer("rpc"))),
       );
     });
