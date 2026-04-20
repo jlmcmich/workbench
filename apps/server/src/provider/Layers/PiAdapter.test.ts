@@ -1066,6 +1066,164 @@ describe("PiAdapterLive", () => {
       );
     });
 
+    it("resets session status to ready after turn_end", async () => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const { rpcChildren } = installRpcSpawnMock();
+          const adapter = yield* PiAdapter;
+          const threadId = asThreadId("thread-pi-rpc-idle-after-turn");
+
+          yield* adapter.startSession({
+            provider: "pi",
+            threadId,
+            runtimeMode: "full-access",
+          });
+          yield* Effect.sleep(10);
+          const child = rpcChildren[0]!;
+
+          const sendPromise = Effect.runPromise(
+            adapter.sendTurn({ threadId, input: "ping" }).pipe(Effect.provide(makeTestLayer("rpc"))),
+          );
+          yield* Effect.sleep(10);
+          const promptFrame = child.writtenFrames().find((f) => f.type === "prompt")!;
+          child.respondTo(promptFrame, { success: true });
+
+          // While the turn is in flight, session should be running.
+          const runningSessions = yield* adapter.listSessions();
+          const running = runningSessions.find((s) => s.threadId === threadId)!;
+          assert.equal(running.status, "running");
+          assert.ok(running.activeTurnId, "activeTurnId should be set during turn");
+
+          child.notify({
+            type: "turn_end",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "pong" }],
+              stopReason: "stop",
+            },
+          });
+          yield* Effect.promise(() => sendPromise);
+          yield* Effect.sleep(5);
+
+          // After turn_end the session should snap back to idle.
+          const idleSessions = yield* adapter.listSessions();
+          const idle = idleSessions.find((s) => s.threadId === threadId)!;
+          assert.equal(idle.status, "ready", "status should return to ready");
+          assert.equal(idle.activeTurnId, undefined, "activeTurnId should be cleared");
+        }).pipe(Effect.provide(makeTestLayer("rpc"))),
+      );
+    });
+
+    it("rejects a second sendTurn while one is in flight", async () => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const { rpcChildren } = installRpcSpawnMock();
+          const adapter = yield* PiAdapter;
+          const threadId = asThreadId("thread-pi-rpc-concurrent");
+
+          yield* adapter.startSession({
+            provider: "pi",
+            threadId,
+            runtimeMode: "full-access",
+          });
+          yield* Effect.sleep(10);
+          const child = rpcChildren[0]!;
+
+          const firstTurn = Effect.runPromise(
+            adapter.sendTurn({ threadId, input: "first" }).pipe(Effect.provide(makeTestLayer("rpc"))),
+          );
+          yield* Effect.sleep(10);
+          const firstPrompt = child.writtenFrames().find((f) => f.type === "prompt")!;
+          child.respondTo(firstPrompt, { success: true });
+          // Do NOT emit turn_end yet — keep the turn in flight.
+
+          const attempt = yield* adapter
+            .sendTurn({ threadId, input: "second" })
+            .pipe(Effect.flip);
+          assert.equal(attempt._tag, "ProviderAdapterRequestError");
+
+          // Settle the first turn so the fiber drains.
+          child.notify({
+            type: "turn_end",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "done" }],
+              stopReason: "stop",
+            },
+          });
+          yield* Effect.promise(() => firstTurn);
+        }).pipe(Effect.provide(makeTestLayer("rpc"))),
+      );
+    });
+
+    it("warns on bare-slug mid-session switch and keeps session.model pinned", async () => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const { rpcChildren } = installRpcSpawnMock();
+          const adapter = yield* PiAdapter;
+          const threadId = asThreadId("thread-pi-rpc-bare-slug");
+
+          yield* adapter.startSession({
+            provider: "pi",
+            threadId,
+            runtimeMode: "full-access",
+            modelSelection: { provider: "pi", model: "openai-codex/gpt-5.4" },
+          });
+          yield* Effect.sleep(10);
+          const child = rpcChildren[0]!;
+
+          const eventsFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 2)).pipe(
+            Effect.forkChild,
+          );
+          yield* Effect.sleep(0);
+
+          const sendPromise = Effect.runPromise(
+            adapter
+              .sendTurn({
+                threadId,
+                input: "switch?",
+                modelSelection: { provider: "pi", model: "claude-haiku-4-5" }, // bare
+              })
+              .pipe(Effect.provide(makeTestLayer("rpc"))),
+          );
+          yield* Effect.sleep(10);
+          const promptFrame = child.writtenFrames().find((f) => f.type === "prompt")!;
+
+          // No set_model frame should have been sent for the bare slug.
+          assert.equal(
+            child.writtenFrames().some((f) => f.type === "set_model"),
+            false,
+            "set_model should not be called for bare slugs",
+          );
+
+          child.respondTo(promptFrame, { success: true });
+          child.notify({
+            type: "turn_end",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "k" }],
+              stopReason: "stop",
+            },
+          });
+          yield* Effect.promise(() => sendPromise);
+
+          const events = yield* joinEvents(eventsFiber);
+          const warning = events.find((e) => e.type === "runtime.warning");
+          assert.ok(warning, "should emit a runtime.warning");
+          if (warning?.type !== "runtime.warning") throw new Error();
+          assert.match(warning.payload.message, /bare slug/i);
+
+          const sessions = yield* adapter.listSessions();
+          const session = sessions.find((s) => s.threadId === threadId)!;
+          assert.equal(
+            session.model,
+            "openai-codex/gpt-5.4",
+            "session.model should stay pinned to the pi-active model when switch is skipped",
+          );
+        }).pipe(Effect.provide(makeTestLayer("rpc"))),
+      );
+    });
+
     it("readThread returns empty turns in json transport", async () => {
       await Effect.runPromise(
         Effect.gen(function* () {
