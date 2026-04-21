@@ -51,6 +51,11 @@ import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import {
+  clearPiSessionRecord,
+  loadPiSessionRecord,
+  savePiSessionRecord,
+} from "../piSessionStore.ts";
+import {
   ProviderAdapterProcessError,
   ProviderAdapterRequestError,
   ProviderAdapterSessionClosedError,
@@ -1629,6 +1634,61 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
             ctx.rpcMaxTokens = capacityMap.get(rpcModel) ?? capacityMap.get(normalizedModel);
             attachSessionListeners(ctx);
 
+            // Cross-restart session recovery: pi's JSONL session files
+            // persist under ~/.pi/agent/sessions/, and we remembered which
+            // one maps to this thread on the last startSession. Ask pi to
+            // reattach to it via `switch_session` before we probe state, so
+            // the transcript, tool calls, and queued follow-ups the user
+            // left behind are preserved across server/desktop restarts.
+            // Failure is non-fatal — if pi rejects (file deleted, rename,
+            // version skew) we just continue and a fresh session gets
+            // persisted on the next save.
+            const storedRecord = yield* loadPiSessionRecord({
+              stateDir: serverConfig.stateDir,
+              threadId: input.threadId,
+            })
+              .pipe(Effect.provideService(FileSystem.FileSystem, fileSystem))
+              .pipe(
+                Effect.timeout(1_000),
+                Effect.catch(() => Effect.succeed(undefined)),
+              );
+            if (storedRecord !== undefined) {
+              const switchResult = yield* Effect.promise(() =>
+                Promise.race([
+                  ctx.rpc!.call<{ cancelled?: boolean }>("switch_session", {
+                    sessionPath: storedRecord.sessionFile,
+                  }),
+                  new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 2_000)),
+                ]),
+              );
+              if (switchResult === "timeout") {
+                yield* emit({
+                  ...buildEventBase({ threadId: input.threadId }),
+                  type: "runtime.warning",
+                  payload: {
+                    message: `pi did not respond to switch_session (${storedRecord.sessionFile}); starting fresh.`,
+                  },
+                });
+              } else if (!switchResult.success) {
+                yield* emit({
+                  ...buildEventBase({ threadId: input.threadId }),
+                  type: "runtime.warning",
+                  payload: {
+                    message: `pi could not resume prior session (${storedRecord.sessionFile}): ${switchResult.error}. Starting fresh.`,
+                  },
+                });
+                yield* clearPiSessionRecord({
+                  stateDir: serverConfig.stateDir,
+                  threadId: input.threadId,
+                })
+                  .pipe(Effect.provideService(FileSystem.FileSystem, fileSystem))
+                  .pipe(
+                    Effect.timeout(1_000),
+                    Effect.catch(() => Effect.void),
+                  );
+              }
+            }
+
             // Sync adapter state with pi's own view. Pi persists `isStreaming`
             // in its session file, so reconnecting to a dormant thread where
             // a previous turn queued a follow_up — or where the prior child
@@ -1655,6 +1715,22 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
               }
               if (typeof state.sessionFile === "string") {
                 ctx.piSessionFile = state.sessionFile;
+                // Durably map this thread → pi session file so the next
+                // startSession (possibly after a server restart) can
+                // resume instead of forcing a fresh session. Write failures
+                // are swallowed — worst case we lose restart resilience
+                // for one thread.
+                yield* savePiSessionRecord({
+                  stateDir: serverConfig.stateDir,
+                  threadId: input.threadId,
+                  sessionFile: state.sessionFile,
+                  ...(ctx.piSessionUuid ? { sessionId: ctx.piSessionUuid } : {}),
+                })
+                  .pipe(Effect.provideService(FileSystem.FileSystem, fileSystem))
+                  .pipe(
+                    Effect.timeout(1_000),
+                    Effect.catch(() => Effect.void),
+                  );
               }
               if (state.isStreaming === true) {
                 // pi is mid-turn from a prior session. Stand up a placeholder
@@ -2309,14 +2385,92 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
           return { threadId, turns: mapPiMessagesToTurns(messages) };
         });
 
-      const rollbackThread: PiAdapterShape["rollbackThread"] = () =>
-        Effect.fail(
-          new ProviderAdapterRequestError({
-            provider: PROVIDER,
-            method: "rollbackThread",
-            detail: "pi does not yet support rollback",
-          }),
-        );
+      const rollbackThread: PiAdapterShape["rollbackThread"] = (threadId, numTurns) =>
+        Effect.gen(function* () {
+          if (!Number.isInteger(numTurns) || numTurns < 1) {
+            return yield* new ProviderAdapterValidationError({
+              provider: PROVIDER,
+              operation: "rollbackThread",
+              issue: "numTurns must be a positive integer.",
+            });
+          }
+          const ctx = yield* requireSession(threadId);
+          if (ctx.transport !== "rpc" || !ctx.rpc) {
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "rollbackThread",
+              detail: "pi rollback requires the rpc transport.",
+            });
+          }
+          if (ctx.activeTurn) {
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "rollbackThread",
+              detail:
+                "Cannot rollback while a turn is in flight; interrupt or wait for it to settle.",
+            });
+          }
+
+          // Pi's `get_fork_messages` returns the list of forkable user
+          // messages (oldest → newest) with their entry ids. A `fork
+          // {entryId}` then rewinds the session to before that entry,
+          // returning its text so the user could resubmit it. We pick the
+          // entry N turns back from the tip; N == messages.length means
+          // forking the first user message, which effectively resets the
+          // session.
+          const forkMessagesResult = yield* Effect.promise(() =>
+            ctx.rpc!.call<{
+              messages: ReadonlyArray<{ entryId: string; text?: string }>;
+            }>("get_fork_messages"),
+          );
+          if (!forkMessagesResult.success) {
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "rollbackThread",
+              detail: `pi get_fork_messages failed: ${forkMessagesResult.error}`,
+            });
+          }
+          const messages = Array.isArray(forkMessagesResult.data?.messages)
+            ? forkMessagesResult.data.messages
+            : [];
+          if (numTurns > messages.length) {
+            return yield* new ProviderAdapterValidationError({
+              provider: PROVIDER,
+              operation: "rollbackThread",
+              issue: `Cannot roll back ${numTurns} turns; thread has only ${messages.length} user messages.`,
+            });
+          }
+          const targetIndex = messages.length - numTurns;
+          const targetEntry = messages[targetIndex];
+          if (!targetEntry || typeof targetEntry.entryId !== "string") {
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "rollbackThread",
+              detail: "pi returned a fork message without an entryId.",
+            });
+          }
+
+          const forkResult = yield* Effect.promise(() =>
+            ctx.rpc!.call<{ cancelled?: boolean }>("fork", { entryId: targetEntry.entryId }),
+          );
+          if (!forkResult.success) {
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "rollbackThread",
+              detail: `pi fork failed: ${forkResult.error}`,
+            });
+          }
+          if (forkResult.data?.cancelled === true) {
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "rollbackThread",
+              detail: "pi fork was cancelled by an extension.",
+            });
+          }
+
+          // Re-read the snapshot so the caller sees the rewound state.
+          return yield* readThread(threadId);
+        });
 
       const stopAll: PiAdapterShape["stopAll"] = () =>
         Effect.gen(function* () {
