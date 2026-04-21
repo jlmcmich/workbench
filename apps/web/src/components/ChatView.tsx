@@ -1059,6 +1059,10 @@ export default function ChatView(props: ChatViewProps) {
   );
   const selectedProvider: ProviderKind = lockedProvider ?? unlockedSelectedProvider;
   const phase = derivePhase(activeThread?.session ?? null);
+  // `canQueue` gates the composer's steer/follow-up menu. Pi is the only
+  // provider that accepts queued messages today; other providers return a
+  // request error if the command reaches them, so don't offer the UI.
+  const canQueue = threadProvider === "pi" && phase === "running";
   const threadActivities = activeThread?.activities ?? EMPTY_ACTIVITIES;
   const workLogEntries = useMemo(
     () => deriveWorkLogEntries(threadActivities, activeLatestTurn?.turnId ?? undefined),
@@ -2646,6 +2650,39 @@ export default function ChatView(props: ChatViewProps) {
     });
   };
 
+  // Queue a prompt against the in-flight turn (pi-only today). Mirrors
+  // onSend but dispatches `thread.turn.queue` with the selected kind and
+  // clears the composer text so the user sees it was sent. Attachments
+  // aren't included yet — adding them would require decisions about
+  // whether images apply to the in-flight turn or the queued follow-up.
+  const onQueueMessage = useCallback(
+    async (kind: "steer" | "followUp") => {
+      const api = readEnvironmentApi(environmentId);
+      if (!api || !activeThread) return;
+      const text = promptRef.current.trim();
+      if (text.length === 0) return;
+      await api.orchestration.dispatchCommand({
+        type: "thread.turn.queue",
+        commandId: newCommandId(),
+        threadId: activeThread.id,
+        kind,
+        text,
+        createdAt: new Date().toISOString(),
+      });
+      promptRef.current = "";
+      clearComposerDraftContent(composerDraftTarget);
+      composerRef.current?.resetCursorState();
+    },
+    [
+      environmentId,
+      activeThread,
+      promptRef,
+      clearComposerDraftContent,
+      composerDraftTarget,
+      composerRef,
+    ],
+  );
+
   const onRespondToApproval = useCallback(
     async (requestId: ApprovalRequestId, decision: ProviderApprovalDecision) => {
       const api = readEnvironmentApi(environmentId);
@@ -3342,6 +3379,8 @@ export default function ChatView(props: ChatViewProps) {
               scheduleStickToBottom={scrollToEnd}
               onSend={onSend}
               onInterrupt={onInterrupt}
+              onQueue={onQueueMessage}
+              canQueue={canQueue}
               onImplementPlanInNewThread={onImplementPlanInNewThread}
               onRespondToApproval={onRespondToApproval}
               onSelectActivePendingUserInputOption={onSelectActivePendingUserInputOption}
