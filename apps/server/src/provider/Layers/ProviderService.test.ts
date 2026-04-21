@@ -220,6 +220,7 @@ function makeFakeCodexAdapter(provider: ProviderKind = "codex") {
     startSession,
     sendTurn,
     interruptTurn,
+    queueMessage,
     respondToRequest,
     respondToUserInput,
     stopSession,
@@ -603,6 +604,17 @@ routing.layer("ProviderServiceLive routing", (it) => {
 
       yield* provider.interruptTurn({ threadId: session.threadId });
       assert.deepEqual(routing.codex.interruptTurn.mock.calls, [[session.threadId, undefined]]);
+
+      yield* provider.queueMessage({
+        threadId: session.threadId,
+        kind: "steer",
+        input: "focus on error handling",
+      });
+      assert.equal(routing.codex.queueMessage.mock.calls.length, 1);
+      const queueCall = routing.codex.queueMessage.mock.calls[0];
+      assert.equal(queueCall?.[0], session.threadId);
+      assert.equal(queueCall?.[1], "steer");
+      assert.equal((queueCall?.[2] as { input?: string }).input, "focus on error handling");
 
       yield* provider.respondToRequest({
         threadId: session.threadId,

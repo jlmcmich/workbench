@@ -14,6 +14,7 @@ import {
   NonNegativeInt,
   ThreadId,
   ProviderInterruptTurnInput,
+  ProviderQueueMessageInput,
   ProviderRespondToRequestInput,
   ProviderRespondToUserInputInput,
   ProviderSendTurnInput,
@@ -527,6 +528,49 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     },
   );
 
+  const queueMessage: ProviderServiceShape["queueMessage"] = Effect.fn("queueMessage")(
+    function* (rawInput) {
+      const input = yield* decodeInputOrValidationError({
+        operation: "ProviderService.queueMessage",
+        schema: ProviderQueueMessageInput,
+        payload: rawInput,
+      });
+      let metricProvider = "unknown";
+      return yield* Effect.gen(function* () {
+        const routed = yield* resolveRoutableSession({
+          threadId: input.threadId,
+          operation: "ProviderService.queueMessage",
+          allowRecovery: true,
+        });
+        metricProvider = routed.adapter.provider;
+        yield* Effect.annotateCurrentSpan({
+          "provider.operation": "queue-message",
+          "provider.kind": routed.adapter.provider,
+          "provider.thread_id": input.threadId,
+          "provider.queue_kind": input.kind,
+        });
+        yield* routed.adapter.queueMessage(routed.threadId, input.kind, {
+          threadId: routed.threadId,
+          ...(input.input !== undefined ? { input: input.input } : {}),
+          ...(input.attachments !== undefined ? { attachments: input.attachments } : {}),
+          ...(input.modelSelection !== undefined ? { modelSelection: input.modelSelection } : {}),
+        });
+        yield* analytics.record("provider.turn.queued", {
+          provider: routed.adapter.provider,
+          kind: input.kind,
+        });
+      }).pipe(
+        withMetrics({
+          counter: providerTurnsTotal,
+          outcomeAttributes: () =>
+            providerMetricAttributes(metricProvider, {
+              operation: "queue-message",
+            }),
+        }),
+      );
+    },
+  );
+
   const respondToRequest: ProviderServiceShape["respondToRequest"] = Effect.fn("respondToRequest")(
     function* (rawInput) {
       const input = yield* decodeInputOrValidationError({
@@ -781,6 +825,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     startSession,
     sendTurn,
     interruptTurn,
+    queueMessage,
     respondToRequest,
     respondToUserInput,
     stopSession,

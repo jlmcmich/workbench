@@ -589,6 +589,23 @@ const ThreadTurnInterruptCommand = Schema.Struct({
   createdAt: IsoDateTime,
 });
 
+/**
+ * Queue a prompt against an in-flight turn as a steer (nudge the current
+ * turn before its next model call) or followUp (run after it finishes).
+ * Providers without native queueing (Claude, Codex, Cursor, OpenCode)
+ * reject; pi routes to its native RPC.
+ */
+const ThreadTurnQueueCommand = Schema.Struct({
+  type: Schema.Literal("thread.turn.queue"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  kind: Schema.Literals(["steer", "followUp"]),
+  text: TrimmedNonEmptyString,
+  attachments: Schema.optional(Schema.Array(ChatAttachment)),
+  modelSelection: Schema.optional(ModelSelection),
+  createdAt: IsoDateTime,
+});
+
 const ThreadApprovalRespondCommand = Schema.Struct({
   type: Schema.Literal("thread.approval.respond"),
   commandId: CommandId,
@@ -635,6 +652,7 @@ const DispatchableClientOrchestrationCommand = Schema.Union([
   ThreadInteractionModeSetCommand,
   ThreadTurnStartCommand,
   ThreadTurnInterruptCommand,
+  ThreadTurnQueueCommand,
   ThreadApprovalRespondCommand,
   ThreadUserInputRespondCommand,
   ThreadCheckpointRevertCommand,
@@ -656,6 +674,7 @@ export const ClientOrchestrationCommand = Schema.Union([
   ThreadInteractionModeSetCommand,
   ClientThreadTurnStartCommand,
   ThreadTurnInterruptCommand,
+  ThreadTurnQueueCommand,
   ThreadApprovalRespondCommand,
   ThreadUserInputRespondCommand,
   ThreadCheckpointRevertCommand,
@@ -759,6 +778,7 @@ export const OrchestrationEventType = Schema.Literals([
   "thread.message-sent",
   "thread.turn-start-requested",
   "thread.turn-interrupt-requested",
+  "thread.turn-queue-requested",
   "thread.approval-response-requested",
   "thread.user-input-response-requested",
   "thread.checkpoint-revert-requested",
@@ -883,6 +903,15 @@ export const ThreadTurnStartRequestedPayload = Schema.Struct({
 export const ThreadTurnInterruptRequestedPayload = Schema.Struct({
   threadId: ThreadId,
   turnId: Schema.optional(TurnId),
+  createdAt: IsoDateTime,
+});
+
+export const ThreadTurnQueueRequestedPayload = Schema.Struct({
+  threadId: ThreadId,
+  kind: Schema.Literals(["steer", "followUp"]),
+  text: TrimmedNonEmptyString,
+  attachments: Schema.optional(Schema.Array(ChatAttachment)),
+  modelSelection: Schema.optional(ModelSelection),
   createdAt: IsoDateTime,
 });
 
@@ -1028,6 +1057,11 @@ export const OrchestrationEvent = Schema.Union([
     ...EventBaseFields,
     type: Schema.Literal("thread.turn-interrupt-requested"),
     payload: ThreadTurnInterruptRequestedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.turn-queue-requested"),
+    payload: ThreadTurnQueueRequestedPayload,
   }),
   Schema.Struct({
     ...EventBaseFields,
