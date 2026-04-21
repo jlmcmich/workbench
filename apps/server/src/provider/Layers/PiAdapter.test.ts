@@ -71,13 +71,20 @@ class FakeRpcChildProcess extends EventEmitter {
     readonly sessionFile?: string;
     readonly isStreaming?: boolean;
   } = { isStreaming: false };
+  /** Canned get_commands response — individual tests can mutate via configureCommands. */
+  private commandsResponse: {
+    readonly commands?: ReadonlyArray<unknown>;
+    readonly promptTemplates?: ReadonlyArray<unknown>;
+    readonly skills?: ReadonlyArray<unknown>;
+  } = {};
 
   constructor() {
     super();
     this.stdin = new FakeWritable();
-    // Intercept writes so we can auto-respond to bootstrap frames (get_state)
-    // without every test having to drive that handshake. Individual tests
-    // still observe the frame via writtenFrames().
+    // Intercept writes so we can auto-respond to bootstrap frames
+    // (get_state, get_commands) without every test having to drive the
+    // handshake. Individual tests can still observe the frame via
+    // writtenFrames().
     const originalWrite = this.stdin.write.bind(this.stdin);
     this.stdin.write = (chunk: string | Uint8Array) => {
       const result = originalWrite(chunk);
@@ -93,6 +100,13 @@ class FakeRpcChildProcess extends EventEmitter {
                 `${JSON.stringify({ type: "response", command: "get_state", id: frame.id, success: true, data: this.stateResponse })}\n`,
               ),
             );
+          } else if (frame.type === "get_commands" && typeof frame.id === "string") {
+            setImmediate(() =>
+              this.stdout.emit(
+                "data",
+                `${JSON.stringify({ type: "response", command: "get_commands", id: frame.id, success: true, data: this.commandsResponse })}\n`,
+              ),
+            );
           }
         } catch {
           // ignore — tests may write malformed frames intentionally
@@ -100,6 +114,14 @@ class FakeRpcChildProcess extends EventEmitter {
       }
       return result;
     };
+  }
+
+  configureCommands(commands: {
+    readonly commands?: ReadonlyArray<unknown>;
+    readonly promptTemplates?: ReadonlyArray<unknown>;
+    readonly skills?: ReadonlyArray<unknown>;
+  }): void {
+    this.commandsResponse = commands;
   }
 
   configureState(state: {
@@ -1772,6 +1794,249 @@ describe("PiAdapterLive", () => {
             0,
             "notify/setStatus should not be acknowledged on the wire",
           );
+        }).pipe(Effect.provide(makeTestLayer("rpc"))),
+      );
+    });
+
+    it("maps compaction_start/end into context_compaction lifecycle items", async () => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const { rpcChildren } = installRpcSpawnMock();
+          const adapter = yield* PiAdapter;
+          const threadId = asThreadId("thread-pi-rpc-compaction");
+
+          yield* adapter.startSession({
+            provider: "pi",
+            threadId,
+            runtimeMode: "full-access",
+          });
+          yield* Effect.sleep(10);
+          const child = rpcChildren[0]!;
+
+          // Start a turn so compaction events are turn-scoped.
+          const turnPromise = Effect.runPromise(
+            adapter.sendTurn({ threadId, input: "work" }).pipe(Effect.provide(makeTestLayer("rpc"))),
+          );
+          yield* Effect.sleep(10);
+          const promptFrame = child.writtenFrames().find((f) => f.type === "prompt")!;
+          child.respondTo(promptFrame, { success: true });
+
+          const eventsFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 2)).pipe(
+            Effect.forkChild,
+          );
+          yield* Effect.sleep(0);
+
+          child.notify({ type: "compaction_start", reason: "threshold" });
+          child.notify({
+            type: "compaction_end",
+            reason: "threshold",
+            result: { tokensBefore: 150_000 },
+            aborted: false,
+            willRetry: false,
+          });
+
+          const events = yield* joinEvents(eventsFiber);
+          const started = events.find(
+            (e) => e.type === "item.started" && e.payload.itemType === "context_compaction",
+          );
+          const completed = events.find(
+            (e) => e.type === "item.completed" && e.payload.itemType === "context_compaction",
+          );
+          assert.ok(started, "expected item.started for compaction");
+          assert.ok(completed, "expected item.completed for compaction");
+          if (started?.type === "item.started") {
+            assert.match(started.payload.detail ?? "", /threshold/i);
+          }
+          if (completed?.type === "item.completed") {
+            assert.equal(completed.payload.status, "completed");
+          }
+
+          child.notify({
+            type: "turn_end",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "done" }],
+              stopReason: "stop",
+            },
+          });
+          yield* Effect.promise(() => turnPromise);
+        }).pipe(Effect.provide(makeTestLayer("rpc"))),
+      );
+    });
+
+    it("surfaces auto_retry_start as a runtime.warning with attempt info", async () => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const { rpcChildren } = installRpcSpawnMock();
+          const adapter = yield* PiAdapter;
+          const threadId = asThreadId("thread-pi-rpc-retry");
+
+          yield* adapter.startSession({
+            provider: "pi",
+            threadId,
+            runtimeMode: "full-access",
+          });
+          yield* Effect.sleep(10);
+          const child = rpcChildren[0]!;
+
+          const turnPromise = Effect.runPromise(
+            adapter.sendTurn({ threadId, input: "work" }).pipe(Effect.provide(makeTestLayer("rpc"))),
+          );
+          yield* Effect.sleep(10);
+          const promptFrame = child.writtenFrames().find((f) => f.type === "prompt")!;
+          child.respondTo(promptFrame, { success: true });
+
+          const eventsFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 1)).pipe(
+            Effect.forkChild,
+          );
+          yield* Effect.sleep(0);
+
+          child.notify({
+            type: "auto_retry_start",
+            attempt: 1,
+            maxAttempts: 3,
+            delayMs: 2_000,
+            errorMessage: "529 overloaded",
+          });
+
+          const events = yield* joinEvents(eventsFiber);
+          const warn = events.find((e) => e.type === "runtime.warning");
+          assert.ok(warn);
+          if (warn?.type === "runtime.warning") {
+            assert.match(warn.payload.message, /retrying 1\/3/);
+            assert.match(warn.payload.message, /2000ms/);
+          }
+
+          child.notify({
+            type: "turn_end",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "done" }],
+              stopReason: "stop",
+            },
+          });
+          yield* Effect.promise(() => turnPromise);
+        }).pipe(Effect.provide(makeTestLayer("rpc"))),
+      );
+    });
+
+    it("wraps thinking delta streams in reasoning lifecycle items", async () => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const { rpcChildren } = installRpcSpawnMock();
+          const adapter = yield* PiAdapter;
+          const threadId = asThreadId("thread-pi-rpc-thinking");
+
+          yield* adapter.startSession({
+            provider: "pi",
+            threadId,
+            runtimeMode: "full-access",
+          });
+          yield* Effect.sleep(10);
+          const child = rpcChildren[0]!;
+
+          const turnPromise = Effect.runPromise(
+            adapter.sendTurn({ threadId, input: "think" }).pipe(Effect.provide(makeTestLayer("rpc"))),
+          );
+          yield* Effect.sleep(10);
+          const promptFrame = child.writtenFrames().find((f) => f.type === "prompt")!;
+          child.respondTo(promptFrame, { success: true });
+
+          const eventsFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 3)).pipe(
+            Effect.forkChild,
+          );
+          yield* Effect.sleep(0);
+
+          // Emit thinking_start → delta → thinking_end.
+          child.notify({
+            type: "message_update",
+            message: { role: "assistant" },
+            assistantMessageEvent: { type: "thinking_start" },
+          });
+          child.notify({
+            type: "message_update",
+            message: { role: "assistant" },
+            assistantMessageEvent: { type: "thinking_delta", delta: "let me think..." },
+          });
+          child.notify({
+            type: "message_update",
+            message: { role: "assistant" },
+            assistantMessageEvent: { type: "thinking_end" },
+          });
+
+          const events = yield* joinEvents(eventsFiber);
+          const started = events.find(
+            (e) => e.type === "item.started" && e.payload.itemType === "reasoning",
+          );
+          const completed = events.find(
+            (e) => e.type === "item.completed" && e.payload.itemType === "reasoning",
+          );
+          const delta = events.find(
+            (e) => e.type === "content.delta" && e.payload.streamKind === "reasoning_text",
+          );
+          assert.ok(started, "expected item.started (reasoning) on thinking_start");
+          assert.ok(delta, "expected reasoning_text content.delta");
+          assert.ok(completed, "expected item.completed (reasoning) on thinking_end");
+
+          child.notify({
+            type: "turn_end",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "answer" }],
+              stopReason: "stop",
+            },
+          });
+          yield* Effect.promise(() => turnPromise);
+        }).pipe(Effect.provide(makeTestLayer("rpc"))),
+      );
+    });
+
+    it("emits session.configured with pi commands captured from get_commands", async () => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const rpcChildren: FakeRpcChildProcess[] = [];
+          spawnMock.mockReset();
+          spawnMock.mockImplementation((_bin: string, args: string[]) => {
+            if (args.includes("--list-models")) {
+              const catalog = new FakeChildProcess();
+              setImmediate(() => catalog.emit("exit", 0, null));
+              return catalog;
+            }
+            const child = new FakeRpcChildProcess();
+            child.configureCommands({
+              commands: [{ name: "session-name", description: "set or clear" }],
+              promptTemplates: [{ name: "fix-tests" }],
+              skills: [],
+            });
+            rpcChildren.push(child);
+            return child;
+          });
+
+          const adapter = yield* PiAdapter;
+          const threadId = asThreadId("thread-pi-rpc-commands");
+
+          const eventsFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 4)).pipe(
+            Effect.forkChild,
+          );
+          yield* Effect.sleep(0);
+
+          yield* adapter.startSession({
+            provider: "pi",
+            threadId,
+            runtimeMode: "full-access",
+          });
+          yield* Effect.sleep(20);
+
+          const events = yield* joinEvents(eventsFiber);
+          const configured = events.find((e) => e.type === "session.configured");
+          assert.ok(configured, "expected session.configured event");
+          if (configured?.type === "session.configured") {
+            const config = configured.payload.config as Record<string, unknown>;
+            assert.ok(Array.isArray(config.piCommands));
+            assert.equal((config.piCommands as ReadonlyArray<unknown>).length, 1);
+            assert.ok(Array.isArray(config.piPromptTemplates));
+            assert.equal((config.piPromptTemplates as ReadonlyArray<unknown>).length, 1);
+          }
         }).pipe(Effect.provide(makeTestLayer("rpc"))),
       );
     });

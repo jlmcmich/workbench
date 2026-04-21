@@ -93,6 +93,19 @@ interface PiTurnContext {
   readonly toolItems: Map<string, PiToolState>;
   /** Context-window capacity for the model driving this turn, if known. */
   readonly maxTokens: number | undefined;
+  /**
+   * Item id for the currently-active compaction lifecycle, if any. Carried
+   * so `compaction_end` can close the same `item.started` we emitted on
+   * `compaction_start`.
+   */
+  compactionItemId: string | undefined;
+  /**
+   * Item id for the currently-active thinking block, if any. Pi emits
+   * `thinking_start` / `thinking_end` boundaries around its streamed
+   * reasoning deltas; we materialize them as a single `reasoning` item so
+   * the UI can render a collapsible thinking card.
+   */
+  thinkingItemId: string | undefined;
 }
 
 interface PiSessionContext {
@@ -910,6 +923,87 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
           }).catch(() => undefined);
           return;
         }
+        if (kind === "compaction_start") {
+          // Pi is compressing the transcript because the context window
+          // filled up or the user ran /compact. Surface as a lifecycle
+          // item so the timeline shows "Compacting context…" instead of
+          // going quiet.
+          const itemId = `pi-compaction-${randomUUID()}`;
+          turn.compactionItemId = itemId;
+          const reason = asTrimmedString(raw.reason);
+          void emitPromise({
+            ...buildEventBase({ threadId: ctx.threadId, turnId: turn.turnId, itemId }),
+            type: "item.started",
+            payload: {
+              itemType: "context_compaction",
+              status: "inProgress",
+              title: "Compacting context",
+              ...(reason ? { detail: `Reason: ${reason}` } : {}),
+              data: { reason },
+            },
+          }).catch(() => undefined);
+          return;
+        }
+        if (kind === "compaction_end") {
+          const itemId = turn.compactionItemId;
+          if (!itemId) return;
+          turn.compactionItemId = undefined;
+          const aborted = raw.aborted === true;
+          const willRetry = raw.willRetry === true;
+          void emitPromise({
+            ...buildEventBase({ threadId: ctx.threadId, turnId: turn.turnId, itemId }),
+            type: "item.completed",
+            payload: {
+              itemType: "context_compaction",
+              status: aborted ? "failed" : "completed",
+              title: "Compacting context",
+              ...(aborted
+                ? { detail: willRetry ? "Aborted; will retry" : "Aborted" }
+                : { detail: "Done" }),
+              data: { aborted, willRetry, result: raw.result },
+            },
+          }).catch(() => undefined);
+          return;
+        }
+        if (kind === "auto_retry_start") {
+          // Transient upstream failure (429, overload). Pi is going to try
+          // again on its own. Flag it so the user sees *something* is
+          // happening instead of silent dead air.
+          const attempt = typeof raw.attempt === "number" ? raw.attempt : undefined;
+          const maxAttempts = typeof raw.maxAttempts === "number" ? raw.maxAttempts : undefined;
+          const delayMs = typeof raw.delayMs === "number" ? raw.delayMs : undefined;
+          const errorMessage = asTrimmedString(raw.errorMessage);
+          const attemptLabel =
+            attempt !== undefined && maxAttempts !== undefined
+              ? ` ${attempt}/${maxAttempts}`
+              : attempt !== undefined
+                ? ` ${attempt}`
+                : "";
+          const delayLabel = delayMs !== undefined ? ` in ${delayMs}ms` : "";
+          void emitPromise({
+            ...buildEventBase({ threadId: ctx.threadId, turnId: turn.turnId }),
+            type: "runtime.warning",
+            payload: {
+              message: `pi retrying${attemptLabel}${delayLabel}${errorMessage ? `: ${errorMessage}` : ""}`,
+            },
+          }).catch(() => undefined);
+          return;
+        }
+        if (kind === "auto_retry_end") {
+          // Only surface the failure case — successful retry just resumes
+          // normal streaming and doesn't need a celebratory runtime event.
+          if (raw.success === true) return;
+          const finalError =
+            asTrimmedString(raw.finalError) ??
+            asTrimmedString(raw.errorMessage) ??
+            "pi gave up after retrying.";
+          void emitPromise({
+            ...buildEventBase({ threadId: ctx.threadId, turnId: turn.turnId }),
+            type: "runtime.error",
+            payload: { message: `pi retry exhausted: ${finalError}` },
+          }).catch(() => undefined);
+          return;
+        }
         switch (kind) {
           case "plan":
           case "todos": {
@@ -998,6 +1092,25 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
             if (deltaType === "thinking_delta") {
               const delta = asString(assistantMessageEvent?.delta);
               if (!delta || delta.length === 0) return;
+              // If pi doesn't emit an explicit thinking_start, lazily
+              // open the reasoning item on the first delta so the UI
+              // still gets a card even without the boundary event.
+              if (!turn.thinkingItemId) {
+                turn.thinkingItemId = `pi-thinking-${randomUUID()}`;
+                void emitPromise({
+                  ...buildEventBase({
+                    threadId: ctx.threadId,
+                    turnId: turn.turnId,
+                    itemId: turn.thinkingItemId,
+                  }),
+                  type: "item.started",
+                  payload: {
+                    itemType: "reasoning",
+                    status: "inProgress",
+                    title: "Thinking",
+                  },
+                }).catch(() => undefined);
+              }
               void emitPromise({
                 ...buildEventBase({ threadId: ctx.threadId, turnId: turn.turnId }),
                 type: "content.delta",
@@ -1006,6 +1119,37 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
                   delta,
                 },
               }).catch(() => undefined);
+              return;
+            }
+            if (deltaType === "thinking_start") {
+              if (turn.thinkingItemId) return;
+              const itemId = `pi-thinking-${randomUUID()}`;
+              turn.thinkingItemId = itemId;
+              void emitPromise({
+                ...buildEventBase({ threadId: ctx.threadId, turnId: turn.turnId, itemId }),
+                type: "item.started",
+                payload: {
+                  itemType: "reasoning",
+                  status: "inProgress",
+                  title: "Thinking",
+                },
+              }).catch(() => undefined);
+              return;
+            }
+            if (deltaType === "thinking_end") {
+              const itemId = turn.thinkingItemId;
+              if (!itemId) return;
+              turn.thinkingItemId = undefined;
+              void emitPromise({
+                ...buildEventBase({ threadId: ctx.threadId, turnId: turn.turnId, itemId }),
+                type: "item.completed",
+                payload: {
+                  itemType: "reasoning",
+                  status: "completed",
+                  title: "Thinking",
+                },
+              }).catch(() => undefined);
+              return;
             }
             return;
           }
@@ -1525,6 +1669,8 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
                   assistantTextSeen: false,
                   toolItems: new Map(),
                   maxTokens: ctx.rpcMaxTokens,
+                  compactionItemId: undefined,
+                  thinkingItemId: undefined,
                 };
                 ctx.activeTurn = resumedTurn;
                 ctx.session = {
@@ -1547,6 +1693,37 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
                   },
                 });
               }
+            }
+
+            // Discover installed pi commands, skills, and prompt templates so
+            // a future command palette UI can source them without each
+            // consumer having to call pi directly. Failure is non-fatal —
+            // the session starts fine without a palette.
+            const commandsProbe = yield* Effect.promise(() =>
+              Promise.race([
+                ctx.rpc!.call<{
+                  commands?: ReadonlyArray<unknown>;
+                  promptTemplates?: ReadonlyArray<unknown>;
+                  skills?: ReadonlyArray<unknown>;
+                }>("get_commands"),
+                new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 2_000)),
+              ]),
+            );
+            if (commandsProbe !== "timeout" && commandsProbe.success) {
+              const data = commandsProbe.data ?? {};
+              yield* emit({
+                ...buildEventBase({ threadId: input.threadId }),
+                type: "session.configured",
+                payload: {
+                  config: {
+                    piCommands: Array.isArray(data.commands) ? data.commands : [],
+                    piPromptTemplates: Array.isArray(data.promptTemplates)
+                      ? data.promptTemplates
+                      : [],
+                    piSkills: Array.isArray(data.skills) ? data.skills : [],
+                  },
+                },
+              });
             }
           }
 
@@ -1711,6 +1888,8 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
               assistantTextSeen: false,
               toolItems: new Map(),
               maxTokens: effectiveMaxTokens,
+              compactionItemId: undefined,
+              thinkingItemId: undefined,
             };
             ctx.activeTurn = turn;
             ctx.session = {
@@ -1780,6 +1959,8 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
                   assistantTextSeen: false,
                   toolItems: new Map(),
                   maxTokens: ctx.rpcMaxTokens,
+                  compactionItemId: undefined,
+                  thinkingItemId: undefined,
                 };
                 ctx.session = {
                   ...ctx.session,
@@ -1824,6 +2005,8 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
             assistantTextSeen: false,
             toolItems: new Map(),
             maxTokens,
+            compactionItemId: undefined,
+            thinkingItemId: undefined,
           };
           ctx.activeTurn = turn;
           ctx.session = {
