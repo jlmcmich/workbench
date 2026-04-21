@@ -103,6 +103,32 @@ export const ProviderRespondToUserInputInput = Schema.Struct({
 });
 export type ProviderRespondToUserInputInput = typeof ProviderRespondToUserInputInput.Type;
 
+/**
+ * Verb for a prompt queued against an already-running turn rather than
+ * starting a new one. Mirrors pi's native `steer` / `follow_up` RPCs;
+ * providers without native queueing reject the operation.
+ */
+export const ProviderQueueMessageKind = Schema.Literals(["steer", "followUp"]);
+export type ProviderQueueMessageKind = typeof ProviderQueueMessageKind.Type;
+
+/**
+ * Input to `ProviderService.queueMessage`. Carries the steer / follow-up
+ * verb plus the same shape as `ProviderSendTurnInput` so attachments and
+ * model selection flow through unchanged.
+ */
+export const ProviderQueueMessageInput = Schema.Struct({
+  threadId: ThreadId,
+  kind: ProviderQueueMessageKind,
+  input: Schema.optional(
+    TrimmedNonEmptyString.check(Schema.isMaxLength(PROVIDER_SEND_TURN_MAX_INPUT_CHARS)),
+  ),
+  attachments: Schema.optional(
+    Schema.Array(ChatAttachment).check(Schema.isMaxLength(PROVIDER_SEND_TURN_MAX_ATTACHMENTS)),
+  ),
+  modelSelection: Schema.optional(ModelSelection),
+});
+export type ProviderQueueMessageInput = typeof ProviderQueueMessageInput.Type;
+
 const ProviderEventKind = Schema.Literals(["session", "notification", "request", "error"]);
 
 export const ProviderEvent = Schema.Struct({

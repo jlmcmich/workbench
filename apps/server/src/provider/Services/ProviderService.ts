@@ -14,6 +14,7 @@
 import type {
   ProviderInterruptTurnInput,
   ProviderKind,
+  ProviderQueueMessageInput,
   ProviderRespondToRequestInput,
   ProviderRespondToUserInputInput,
   ProviderRuntimeEvent,
@@ -54,6 +55,16 @@ export interface ProviderServiceShape {
    */
   readonly interruptTurn: (
     input: ProviderInterruptTurnInput,
+  ) => Effect.Effect<void, ProviderServiceError>;
+
+  /**
+   * Enqueue a prompt against the in-flight turn as a steer (nudge the
+   * current turn) or followUp (run after current turn finishes). Routes
+   * through to the adapter's native queue RPC; providers without queueing
+   * return a request error.
+   */
+  readonly queueMessage: (
+    input: ProviderQueueMessageInput,
   ) => Effect.Effect<void, ProviderServiceError>;
 
   /**
