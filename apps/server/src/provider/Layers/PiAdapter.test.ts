@@ -71,13 +71,20 @@ class FakeRpcChildProcess extends EventEmitter {
     readonly sessionFile?: string;
     readonly isStreaming?: boolean;
   } = { isStreaming: false };
+  /** Canned get_commands response — individual tests can mutate via configureCommands. */
+  private commandsResponse: {
+    readonly commands?: ReadonlyArray<unknown>;
+    readonly promptTemplates?: ReadonlyArray<unknown>;
+    readonly skills?: ReadonlyArray<unknown>;
+  } = {};
 
   constructor() {
     super();
     this.stdin = new FakeWritable();
-    // Intercept writes so we can auto-respond to bootstrap frames (get_state)
-    // without every test having to drive that handshake. Individual tests
-    // still observe the frame via writtenFrames().
+    // Intercept writes so we can auto-respond to bootstrap frames
+    // (get_state, get_commands) without every test having to drive the
+    // handshake. Individual tests can still observe the frame via
+    // writtenFrames().
     const originalWrite = this.stdin.write.bind(this.stdin);
     this.stdin.write = (chunk: string | Uint8Array) => {
       const result = originalWrite(chunk);
@@ -93,6 +100,13 @@ class FakeRpcChildProcess extends EventEmitter {
                 `${JSON.stringify({ type: "response", command: "get_state", id: frame.id, success: true, data: this.stateResponse })}\n`,
               ),
             );
+          } else if (frame.type === "get_commands" && typeof frame.id === "string") {
+            setImmediate(() =>
+              this.stdout.emit(
+                "data",
+                `${JSON.stringify({ type: "response", command: "get_commands", id: frame.id, success: true, data: this.commandsResponse })}\n`,
+              ),
+            );
           }
         } catch {
           // ignore — tests may write malformed frames intentionally
@@ -100,6 +114,14 @@ class FakeRpcChildProcess extends EventEmitter {
       }
       return result;
     };
+  }
+
+  configureCommands(commands: {
+    readonly commands?: ReadonlyArray<unknown>;
+    readonly promptTemplates?: ReadonlyArray<unknown>;
+    readonly skills?: ReadonlyArray<unknown>;
+  }): void {
+    this.commandsResponse = commands;
   }
 
   configureState(state: {
@@ -1773,6 +1795,518 @@ describe("PiAdapterLive", () => {
             "notify/setStatus should not be acknowledged on the wire",
           );
         }).pipe(Effect.provide(makeTestLayer("rpc"))),
+      );
+    });
+
+    it("maps compaction_start/end into context_compaction lifecycle items", async () => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const { rpcChildren } = installRpcSpawnMock();
+          const adapter = yield* PiAdapter;
+          const threadId = asThreadId("thread-pi-rpc-compaction");
+
+          yield* adapter.startSession({
+            provider: "pi",
+            threadId,
+            runtimeMode: "full-access",
+          });
+          yield* Effect.sleep(10);
+          const child = rpcChildren[0]!;
+
+          // Start a turn so compaction events are turn-scoped.
+          const turnPromise = Effect.runPromise(
+            adapter.sendTurn({ threadId, input: "work" }).pipe(Effect.provide(makeTestLayer("rpc"))),
+          );
+          yield* Effect.sleep(10);
+          const promptFrame = child.writtenFrames().find((f) => f.type === "prompt")!;
+          child.respondTo(promptFrame, { success: true });
+
+          const eventsFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 2)).pipe(
+            Effect.forkChild,
+          );
+          yield* Effect.sleep(0);
+
+          child.notify({ type: "compaction_start", reason: "threshold" });
+          child.notify({
+            type: "compaction_end",
+            reason: "threshold",
+            result: { tokensBefore: 150_000 },
+            aborted: false,
+            willRetry: false,
+          });
+
+          const events = yield* joinEvents(eventsFiber);
+          const started = events.find(
+            (e) => e.type === "item.started" && e.payload.itemType === "context_compaction",
+          );
+          const completed = events.find(
+            (e) => e.type === "item.completed" && e.payload.itemType === "context_compaction",
+          );
+          assert.ok(started, "expected item.started for compaction");
+          assert.ok(completed, "expected item.completed for compaction");
+          if (started?.type === "item.started") {
+            assert.match(started.payload.detail ?? "", /threshold/i);
+          }
+          if (completed?.type === "item.completed") {
+            assert.equal(completed.payload.status, "completed");
+          }
+
+          child.notify({
+            type: "turn_end",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "done" }],
+              stopReason: "stop",
+            },
+          });
+          yield* Effect.promise(() => turnPromise);
+        }).pipe(Effect.provide(makeTestLayer("rpc"))),
+      );
+    });
+
+    it("surfaces auto_retry_start as a runtime.warning with attempt info", async () => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const { rpcChildren } = installRpcSpawnMock();
+          const adapter = yield* PiAdapter;
+          const threadId = asThreadId("thread-pi-rpc-retry");
+
+          yield* adapter.startSession({
+            provider: "pi",
+            threadId,
+            runtimeMode: "full-access",
+          });
+          yield* Effect.sleep(10);
+          const child = rpcChildren[0]!;
+
+          const turnPromise = Effect.runPromise(
+            adapter.sendTurn({ threadId, input: "work" }).pipe(Effect.provide(makeTestLayer("rpc"))),
+          );
+          yield* Effect.sleep(10);
+          const promptFrame = child.writtenFrames().find((f) => f.type === "prompt")!;
+          child.respondTo(promptFrame, { success: true });
+
+          const eventsFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 1)).pipe(
+            Effect.forkChild,
+          );
+          yield* Effect.sleep(0);
+
+          child.notify({
+            type: "auto_retry_start",
+            attempt: 1,
+            maxAttempts: 3,
+            delayMs: 2_000,
+            errorMessage: "529 overloaded",
+          });
+
+          const events = yield* joinEvents(eventsFiber);
+          const warn = events.find((e) => e.type === "runtime.warning");
+          assert.ok(warn);
+          if (warn?.type === "runtime.warning") {
+            assert.match(warn.payload.message, /retrying 1\/3/);
+            assert.match(warn.payload.message, /2000ms/);
+          }
+
+          child.notify({
+            type: "turn_end",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "done" }],
+              stopReason: "stop",
+            },
+          });
+          yield* Effect.promise(() => turnPromise);
+        }).pipe(Effect.provide(makeTestLayer("rpc"))),
+      );
+    });
+
+    it("wraps thinking delta streams in reasoning lifecycle items", async () => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const { rpcChildren } = installRpcSpawnMock();
+          const adapter = yield* PiAdapter;
+          const threadId = asThreadId("thread-pi-rpc-thinking");
+
+          yield* adapter.startSession({
+            provider: "pi",
+            threadId,
+            runtimeMode: "full-access",
+          });
+          yield* Effect.sleep(10);
+          const child = rpcChildren[0]!;
+
+          const turnPromise = Effect.runPromise(
+            adapter.sendTurn({ threadId, input: "think" }).pipe(Effect.provide(makeTestLayer("rpc"))),
+          );
+          yield* Effect.sleep(10);
+          const promptFrame = child.writtenFrames().find((f) => f.type === "prompt")!;
+          child.respondTo(promptFrame, { success: true });
+
+          const eventsFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 3)).pipe(
+            Effect.forkChild,
+          );
+          yield* Effect.sleep(0);
+
+          // Emit thinking_start → delta → thinking_end.
+          child.notify({
+            type: "message_update",
+            message: { role: "assistant" },
+            assistantMessageEvent: { type: "thinking_start" },
+          });
+          child.notify({
+            type: "message_update",
+            message: { role: "assistant" },
+            assistantMessageEvent: { type: "thinking_delta", delta: "let me think..." },
+          });
+          child.notify({
+            type: "message_update",
+            message: { role: "assistant" },
+            assistantMessageEvent: { type: "thinking_end" },
+          });
+
+          const events = yield* joinEvents(eventsFiber);
+          const started = events.find(
+            (e) => e.type === "item.started" && e.payload.itemType === "reasoning",
+          );
+          const completed = events.find(
+            (e) => e.type === "item.completed" && e.payload.itemType === "reasoning",
+          );
+          const delta = events.find(
+            (e) => e.type === "content.delta" && e.payload.streamKind === "reasoning_text",
+          );
+          assert.ok(started, "expected item.started (reasoning) on thinking_start");
+          assert.ok(delta, "expected reasoning_text content.delta");
+          assert.ok(completed, "expected item.completed (reasoning) on thinking_end");
+
+          child.notify({
+            type: "turn_end",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "answer" }],
+              stopReason: "stop",
+            },
+          });
+          yield* Effect.promise(() => turnPromise);
+        }).pipe(Effect.provide(makeTestLayer("rpc"))),
+      );
+    });
+
+    it("emits session.configured with pi commands captured from get_commands", async () => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const rpcChildren: FakeRpcChildProcess[] = [];
+          spawnMock.mockReset();
+          spawnMock.mockImplementation((_bin: string, args: string[]) => {
+            if (args.includes("--list-models")) {
+              const catalog = new FakeChildProcess();
+              setImmediate(() => catalog.emit("exit", 0, null));
+              return catalog;
+            }
+            const child = new FakeRpcChildProcess();
+            child.configureCommands({
+              commands: [{ name: "session-name", description: "set or clear" }],
+              promptTemplates: [{ name: "fix-tests" }],
+              skills: [],
+            });
+            rpcChildren.push(child);
+            return child;
+          });
+
+          const adapter = yield* PiAdapter;
+          const threadId = asThreadId("thread-pi-rpc-commands");
+
+          const eventsFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 4)).pipe(
+            Effect.forkChild,
+          );
+          yield* Effect.sleep(0);
+
+          yield* adapter.startSession({
+            provider: "pi",
+            threadId,
+            runtimeMode: "full-access",
+          });
+          yield* Effect.sleep(20);
+
+          const events = yield* joinEvents(eventsFiber);
+          const configured = events.find((e) => e.type === "session.configured");
+          assert.ok(configured, "expected session.configured event");
+          if (configured?.type === "session.configured") {
+            const config = configured.payload.config as Record<string, unknown>;
+            assert.ok(Array.isArray(config.piCommands));
+            assert.equal((config.piCommands as ReadonlyArray<unknown>).length, 1);
+            assert.ok(Array.isArray(config.piPromptTemplates));
+            assert.equal((config.piPromptTemplates as ReadonlyArray<unknown>).length, 1);
+          }
+        }).pipe(Effect.provide(makeTestLayer("rpc"))),
+      );
+    });
+
+    it("rollbackThread forks to the entry N turns back and returns a fresh snapshot", async () => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const { rpcChildren } = installRpcSpawnMock();
+          const adapter = yield* PiAdapter;
+          const threadId = asThreadId("thread-pi-rpc-rollback");
+
+          yield* adapter.startSession({
+            provider: "pi",
+            threadId,
+            runtimeMode: "full-access",
+          });
+          yield* Effect.sleep(10);
+          const child = rpcChildren[0]!;
+
+          const rollbackPromise = Effect.runPromise(
+            adapter
+              .rollbackThread(threadId, 1)
+              .pipe(Effect.provide(makeTestLayer("rpc"))),
+          );
+          yield* Effect.sleep(10);
+
+          // Respond to get_fork_messages with 3 user messages.
+          const forkListFrame = child
+            .writtenFrames()
+            .find((f) => f.type === "get_fork_messages") as Record<string, unknown>;
+          assert.ok(forkListFrame, "expected get_fork_messages frame");
+          child.respondTo(forkListFrame, {
+            success: true,
+            data: {
+              messages: [
+                { entryId: "e1", text: "first" },
+                { entryId: "e2", text: "second" },
+                { entryId: "e3", text: "third" },
+              ],
+            },
+          });
+          yield* Effect.sleep(5);
+
+          // Then respond to fork targeting the tip (numTurns=1 → entryId e3).
+          const forkFrame = child
+            .writtenFrames()
+            .find((f) => f.type === "fork") as Record<string, unknown>;
+          assert.ok(forkFrame, "expected fork frame");
+          assert.equal(forkFrame.entryId, "e3");
+          child.respondTo(forkFrame, { success: true, data: { cancelled: false, text: "third" } });
+          yield* Effect.sleep(5);
+
+          // rollbackThread then calls readThread → get_messages. Respond with a shorter list.
+          const getMessagesFrame = child
+            .writtenFrames()
+            .find((f) => f.type === "get_messages") as Record<string, unknown>;
+          assert.ok(getMessagesFrame, "expected get_messages frame after fork");
+          child.respondTo(getMessagesFrame, {
+            success: true,
+            data: {
+              messages: [
+                {
+                  id: "e1",
+                  timestamp: "2026-04-21T00:00:01Z",
+                  message: { role: "user", content: "first", timestamp: 1 },
+                },
+                {
+                  id: "e2",
+                  timestamp: "2026-04-21T00:00:02Z",
+                  message: { role: "user", content: "second", timestamp: 2 },
+                },
+              ],
+            },
+          });
+
+          const snapshot = yield* Effect.promise(() => rollbackPromise);
+          assert.equal(snapshot.threadId, threadId);
+          assert.equal(snapshot.turns.length, 2);
+        }).pipe(Effect.provide(makeTestLayer("rpc"))),
+      );
+    });
+
+    it("rollbackThread rejects numTurns larger than available messages", async () => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const { rpcChildren } = installRpcSpawnMock();
+          const adapter = yield* PiAdapter;
+          const threadId = asThreadId("thread-pi-rpc-rollback-overflow");
+
+          yield* adapter.startSession({
+            provider: "pi",
+            threadId,
+            runtimeMode: "full-access",
+          });
+          yield* Effect.sleep(10);
+          const child = rpcChildren[0]!;
+
+          const rollbackPromise = Effect.runPromise(
+            adapter
+              .rollbackThread(threadId, 5)
+              .pipe(Effect.provide(makeTestLayer("rpc")))
+              .pipe(Effect.flip),
+          );
+          yield* Effect.sleep(10);
+
+          const forkListFrame = child
+            .writtenFrames()
+            .find((f) => f.type === "get_fork_messages") as Record<string, unknown>;
+          child.respondTo(forkListFrame, {
+            success: true,
+            data: { messages: [{ entryId: "e1", text: "only" }] },
+          });
+
+          const err = yield* Effect.promise(() => rollbackPromise);
+          assert.equal(err._tag, "ProviderAdapterValidationError");
+          assert.equal(
+            child.writtenFrames().some((f) => f.type === "fork"),
+            false,
+            "fork must not be called when numTurns exceeds available messages",
+          );
+        }).pipe(Effect.provide(makeTestLayer("rpc"))),
+      );
+    });
+
+    it("rollbackThread refuses while a turn is in flight", async () => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const { rpcChildren } = installRpcSpawnMock();
+          const adapter = yield* PiAdapter;
+          const threadId = asThreadId("thread-pi-rpc-rollback-busy");
+
+          yield* adapter.startSession({
+            provider: "pi",
+            threadId,
+            runtimeMode: "full-access",
+          });
+          yield* Effect.sleep(10);
+          const child = rpcChildren[0]!;
+
+          const turnPromise = Effect.runPromise(
+            adapter.sendTurn({ threadId, input: "go" }).pipe(Effect.provide(makeTestLayer("rpc"))),
+          );
+          yield* Effect.sleep(10);
+          const promptFrame = child.writtenFrames().find((f) => f.type === "prompt")!;
+          child.respondTo(promptFrame, { success: true });
+          // Don't settle the turn yet — it's "in flight" from our POV.
+
+          const err = yield* adapter
+            .rollbackThread(threadId, 1)
+            .pipe(Effect.flip);
+          assert.equal(err._tag, "ProviderAdapterRequestError");
+
+          // Drain the turn so the fiber cleans up.
+          child.notify({
+            type: "turn_end",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "done" }],
+              stopReason: "stop",
+            },
+          });
+          yield* Effect.promise(() => turnPromise);
+        }).pipe(Effect.provide(makeTestLayer("rpc"))),
+      );
+    });
+
+    it("persists sessionFile on startSession and reuses it via switch_session on reconnect", async () => {
+      const baseDir = mkdtempSync(pathJoin(tmpdir(), "pi-resume-"));
+      const persistLayer = makePiAdapterLive().pipe(
+        Layer.provideMerge(ServerConfig.layerTest(process.cwd(), baseDir)),
+        Layer.provideMerge(
+          ServerSettingsService.layerTest({
+            providers: {
+              pi: {
+                binaryPath: "fake-pi",
+                defaultProvider: "",
+                customModels: [],
+                enabled: true,
+                transport: "rpc",
+              },
+            },
+          }),
+        ),
+        Layer.provideMerge(NodeServices.layer),
+      );
+
+      // -- First session: no stored record yet → no switch_session, save new path.
+      const firstRpcChildren: FakeRpcChildProcess[] = [];
+      spawnMock.mockReset();
+      spawnMock.mockImplementation((_bin: string, args: string[]) => {
+        if (args.includes("--list-models")) {
+          const catalog = new FakeChildProcess();
+          setImmediate(() => catalog.emit("exit", 0, null));
+          return catalog;
+        }
+        const child = new FakeRpcChildProcess();
+        child.configureState({
+          sessionId: "pi-uuid-persist-1",
+          sessionFile: "/tmp/pi-sessions/persist-1.jsonl",
+        });
+        firstRpcChildren.push(child);
+        return child;
+      });
+
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const adapter = yield* PiAdapter;
+          const threadId = asThreadId("thread-pi-rpc-persist");
+          yield* adapter.startSession({
+            provider: "pi",
+            threadId,
+            runtimeMode: "full-access",
+          });
+          yield* Effect.sleep(30);
+          const child = firstRpcChildren[0]!;
+          const switchFrames = child.writtenFrames().filter((f) => f.type === "switch_session");
+          assert.equal(
+            switchFrames.length,
+            0,
+            "first startSession should not switch_session (nothing stored yet)",
+          );
+        }).pipe(Effect.provide(persistLayer)),
+      );
+
+      // -- Second session: stored record should drive switch_session.
+      const secondRpcChildren: FakeRpcChildProcess[] = [];
+      spawnMock.mockReset();
+      spawnMock.mockImplementation((_bin: string, args: string[]) => {
+        if (args.includes("--list-models")) {
+          const catalog = new FakeChildProcess();
+          setImmediate(() => catalog.emit("exit", 0, null));
+          return catalog;
+        }
+        const child = new FakeRpcChildProcess();
+        child.configureState({
+          sessionId: "pi-uuid-persist-1",
+          sessionFile: "/tmp/pi-sessions/persist-1.jsonl",
+        });
+        secondRpcChildren.push(child);
+        return child;
+      });
+
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const adapter = yield* PiAdapter;
+          const threadId = asThreadId("thread-pi-rpc-persist");
+          const startPromise = Effect.runPromise(
+            adapter
+              .startSession({ provider: "pi", threadId, runtimeMode: "full-access" })
+              .pipe(Effect.provide(persistLayer)),
+          );
+          yield* Effect.sleep(10);
+          const child = secondRpcChildren[0]!;
+          // Answer the switch_session that the adapter should fire before get_state.
+          // (FakeRpcChildProcess doesn't auto-respond to it, so we match + respond
+          // manually to keep the call synchronous.)
+          const pollStart = Date.now();
+          while (Date.now() - pollStart < 500) {
+            const frame = child
+              .writtenFrames()
+              .find((f) => f.type === "switch_session") as Record<string, unknown>;
+            if (frame) {
+              assert.equal(frame.sessionPath, "/tmp/pi-sessions/persist-1.jsonl");
+              child.respondTo(frame, { success: true });
+              break;
+            }
+            yield* Effect.sleep(10);
+          }
+          yield* Effect.promise(() => startPromise);
+        }).pipe(Effect.provide(persistLayer)),
       );
     });
 

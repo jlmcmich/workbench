@@ -51,6 +51,11 @@ import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import {
+  clearPiSessionRecord,
+  loadPiSessionRecord,
+  savePiSessionRecord,
+} from "../piSessionStore.ts";
+import {
   ProviderAdapterProcessError,
   ProviderAdapterRequestError,
   ProviderAdapterSessionClosedError,
@@ -93,6 +98,19 @@ interface PiTurnContext {
   readonly toolItems: Map<string, PiToolState>;
   /** Context-window capacity for the model driving this turn, if known. */
   readonly maxTokens: number | undefined;
+  /**
+   * Item id for the currently-active compaction lifecycle, if any. Carried
+   * so `compaction_end` can close the same `item.started` we emitted on
+   * `compaction_start`.
+   */
+  compactionItemId: string | undefined;
+  /**
+   * Item id for the currently-active thinking block, if any. Pi emits
+   * `thinking_start` / `thinking_end` boundaries around its streamed
+   * reasoning deltas; we materialize them as a single `reasoning` item so
+   * the UI can render a collapsible thinking card.
+   */
+  thinkingItemId: string | undefined;
 }
 
 interface PiSessionContext {
@@ -910,6 +928,87 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
           }).catch(() => undefined);
           return;
         }
+        if (kind === "compaction_start") {
+          // Pi is compressing the transcript because the context window
+          // filled up or the user ran /compact. Surface as a lifecycle
+          // item so the timeline shows "Compacting context…" instead of
+          // going quiet.
+          const itemId = `pi-compaction-${randomUUID()}`;
+          turn.compactionItemId = itemId;
+          const reason = asTrimmedString(raw.reason);
+          void emitPromise({
+            ...buildEventBase({ threadId: ctx.threadId, turnId: turn.turnId, itemId }),
+            type: "item.started",
+            payload: {
+              itemType: "context_compaction",
+              status: "inProgress",
+              title: "Compacting context",
+              ...(reason ? { detail: `Reason: ${reason}` } : {}),
+              data: { reason },
+            },
+          }).catch(() => undefined);
+          return;
+        }
+        if (kind === "compaction_end") {
+          const itemId = turn.compactionItemId;
+          if (!itemId) return;
+          turn.compactionItemId = undefined;
+          const aborted = raw.aborted === true;
+          const willRetry = raw.willRetry === true;
+          void emitPromise({
+            ...buildEventBase({ threadId: ctx.threadId, turnId: turn.turnId, itemId }),
+            type: "item.completed",
+            payload: {
+              itemType: "context_compaction",
+              status: aborted ? "failed" : "completed",
+              title: "Compacting context",
+              ...(aborted
+                ? { detail: willRetry ? "Aborted; will retry" : "Aborted" }
+                : { detail: "Done" }),
+              data: { aborted, willRetry, result: raw.result },
+            },
+          }).catch(() => undefined);
+          return;
+        }
+        if (kind === "auto_retry_start") {
+          // Transient upstream failure (429, overload). Pi is going to try
+          // again on its own. Flag it so the user sees *something* is
+          // happening instead of silent dead air.
+          const attempt = typeof raw.attempt === "number" ? raw.attempt : undefined;
+          const maxAttempts = typeof raw.maxAttempts === "number" ? raw.maxAttempts : undefined;
+          const delayMs = typeof raw.delayMs === "number" ? raw.delayMs : undefined;
+          const errorMessage = asTrimmedString(raw.errorMessage);
+          const attemptLabel =
+            attempt !== undefined && maxAttempts !== undefined
+              ? ` ${attempt}/${maxAttempts}`
+              : attempt !== undefined
+                ? ` ${attempt}`
+                : "";
+          const delayLabel = delayMs !== undefined ? ` in ${delayMs}ms` : "";
+          void emitPromise({
+            ...buildEventBase({ threadId: ctx.threadId, turnId: turn.turnId }),
+            type: "runtime.warning",
+            payload: {
+              message: `pi retrying${attemptLabel}${delayLabel}${errorMessage ? `: ${errorMessage}` : ""}`,
+            },
+          }).catch(() => undefined);
+          return;
+        }
+        if (kind === "auto_retry_end") {
+          // Only surface the failure case — successful retry just resumes
+          // normal streaming and doesn't need a celebratory runtime event.
+          if (raw.success === true) return;
+          const finalError =
+            asTrimmedString(raw.finalError) ??
+            asTrimmedString(raw.errorMessage) ??
+            "pi gave up after retrying.";
+          void emitPromise({
+            ...buildEventBase({ threadId: ctx.threadId, turnId: turn.turnId }),
+            type: "runtime.error",
+            payload: { message: `pi retry exhausted: ${finalError}` },
+          }).catch(() => undefined);
+          return;
+        }
         switch (kind) {
           case "plan":
           case "todos": {
@@ -998,6 +1097,25 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
             if (deltaType === "thinking_delta") {
               const delta = asString(assistantMessageEvent?.delta);
               if (!delta || delta.length === 0) return;
+              // If pi doesn't emit an explicit thinking_start, lazily
+              // open the reasoning item on the first delta so the UI
+              // still gets a card even without the boundary event.
+              if (!turn.thinkingItemId) {
+                turn.thinkingItemId = `pi-thinking-${randomUUID()}`;
+                void emitPromise({
+                  ...buildEventBase({
+                    threadId: ctx.threadId,
+                    turnId: turn.turnId,
+                    itemId: turn.thinkingItemId,
+                  }),
+                  type: "item.started",
+                  payload: {
+                    itemType: "reasoning",
+                    status: "inProgress",
+                    title: "Thinking",
+                  },
+                }).catch(() => undefined);
+              }
               void emitPromise({
                 ...buildEventBase({ threadId: ctx.threadId, turnId: turn.turnId }),
                 type: "content.delta",
@@ -1006,6 +1124,37 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
                   delta,
                 },
               }).catch(() => undefined);
+              return;
+            }
+            if (deltaType === "thinking_start") {
+              if (turn.thinkingItemId) return;
+              const itemId = `pi-thinking-${randomUUID()}`;
+              turn.thinkingItemId = itemId;
+              void emitPromise({
+                ...buildEventBase({ threadId: ctx.threadId, turnId: turn.turnId, itemId }),
+                type: "item.started",
+                payload: {
+                  itemType: "reasoning",
+                  status: "inProgress",
+                  title: "Thinking",
+                },
+              }).catch(() => undefined);
+              return;
+            }
+            if (deltaType === "thinking_end") {
+              const itemId = turn.thinkingItemId;
+              if (!itemId) return;
+              turn.thinkingItemId = undefined;
+              void emitPromise({
+                ...buildEventBase({ threadId: ctx.threadId, turnId: turn.turnId, itemId }),
+                type: "item.completed",
+                payload: {
+                  itemType: "reasoning",
+                  status: "completed",
+                  title: "Thinking",
+                },
+              }).catch(() => undefined);
+              return;
             }
             return;
           }
@@ -1485,6 +1634,61 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
             ctx.rpcMaxTokens = capacityMap.get(rpcModel) ?? capacityMap.get(normalizedModel);
             attachSessionListeners(ctx);
 
+            // Cross-restart session recovery: pi's JSONL session files
+            // persist under ~/.pi/agent/sessions/, and we remembered which
+            // one maps to this thread on the last startSession. Ask pi to
+            // reattach to it via `switch_session` before we probe state, so
+            // the transcript, tool calls, and queued follow-ups the user
+            // left behind are preserved across server/desktop restarts.
+            // Failure is non-fatal — if pi rejects (file deleted, rename,
+            // version skew) we just continue and a fresh session gets
+            // persisted on the next save.
+            const storedRecord = yield* loadPiSessionRecord({
+              stateDir: serverConfig.stateDir,
+              threadId: input.threadId,
+            })
+              .pipe(Effect.provideService(FileSystem.FileSystem, fileSystem))
+              .pipe(
+                Effect.timeout(1_000),
+                Effect.catch(() => Effect.succeed(undefined)),
+              );
+            if (storedRecord !== undefined) {
+              const switchResult = yield* Effect.promise(() =>
+                Promise.race([
+                  ctx.rpc!.call<{ cancelled?: boolean }>("switch_session", {
+                    sessionPath: storedRecord.sessionFile,
+                  }),
+                  new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 2_000)),
+                ]),
+              );
+              if (switchResult === "timeout") {
+                yield* emit({
+                  ...buildEventBase({ threadId: input.threadId }),
+                  type: "runtime.warning",
+                  payload: {
+                    message: `pi did not respond to switch_session (${storedRecord.sessionFile}); starting fresh.`,
+                  },
+                });
+              } else if (!switchResult.success) {
+                yield* emit({
+                  ...buildEventBase({ threadId: input.threadId }),
+                  type: "runtime.warning",
+                  payload: {
+                    message: `pi could not resume prior session (${storedRecord.sessionFile}): ${switchResult.error}. Starting fresh.`,
+                  },
+                });
+                yield* clearPiSessionRecord({
+                  stateDir: serverConfig.stateDir,
+                  threadId: input.threadId,
+                })
+                  .pipe(Effect.provideService(FileSystem.FileSystem, fileSystem))
+                  .pipe(
+                    Effect.timeout(1_000),
+                    Effect.catch(() => Effect.void),
+                  );
+              }
+            }
+
             // Sync adapter state with pi's own view. Pi persists `isStreaming`
             // in its session file, so reconnecting to a dormant thread where
             // a previous turn queued a follow_up — or where the prior child
@@ -1511,6 +1715,22 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
               }
               if (typeof state.sessionFile === "string") {
                 ctx.piSessionFile = state.sessionFile;
+                // Durably map this thread → pi session file so the next
+                // startSession (possibly after a server restart) can
+                // resume instead of forcing a fresh session. Write failures
+                // are swallowed — worst case we lose restart resilience
+                // for one thread.
+                yield* savePiSessionRecord({
+                  stateDir: serverConfig.stateDir,
+                  threadId: input.threadId,
+                  sessionFile: state.sessionFile,
+                  ...(ctx.piSessionUuid ? { sessionId: ctx.piSessionUuid } : {}),
+                })
+                  .pipe(Effect.provideService(FileSystem.FileSystem, fileSystem))
+                  .pipe(
+                    Effect.timeout(1_000),
+                    Effect.catch(() => Effect.void),
+                  );
               }
               if (state.isStreaming === true) {
                 // pi is mid-turn from a prior session. Stand up a placeholder
@@ -1525,6 +1745,8 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
                   assistantTextSeen: false,
                   toolItems: new Map(),
                   maxTokens: ctx.rpcMaxTokens,
+                  compactionItemId: undefined,
+                  thinkingItemId: undefined,
                 };
                 ctx.activeTurn = resumedTurn;
                 ctx.session = {
@@ -1547,6 +1769,37 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
                   },
                 });
               }
+            }
+
+            // Discover installed pi commands, skills, and prompt templates so
+            // a future command palette UI can source them without each
+            // consumer having to call pi directly. Failure is non-fatal —
+            // the session starts fine without a palette.
+            const commandsProbe = yield* Effect.promise(() =>
+              Promise.race([
+                ctx.rpc!.call<{
+                  commands?: ReadonlyArray<unknown>;
+                  promptTemplates?: ReadonlyArray<unknown>;
+                  skills?: ReadonlyArray<unknown>;
+                }>("get_commands"),
+                new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 2_000)),
+              ]),
+            );
+            if (commandsProbe !== "timeout" && commandsProbe.success) {
+              const data = commandsProbe.data ?? {};
+              yield* emit({
+                ...buildEventBase({ threadId: input.threadId }),
+                type: "session.configured",
+                payload: {
+                  config: {
+                    piCommands: Array.isArray(data.commands) ? data.commands : [],
+                    piPromptTemplates: Array.isArray(data.promptTemplates)
+                      ? data.promptTemplates
+                      : [],
+                    piSkills: Array.isArray(data.skills) ? data.skills : [],
+                  },
+                },
+              });
             }
           }
 
@@ -1711,6 +1964,8 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
               assistantTextSeen: false,
               toolItems: new Map(),
               maxTokens: effectiveMaxTokens,
+              compactionItemId: undefined,
+              thinkingItemId: undefined,
             };
             ctx.activeTurn = turn;
             ctx.session = {
@@ -1780,6 +2035,8 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
                   assistantTextSeen: false,
                   toolItems: new Map(),
                   maxTokens: ctx.rpcMaxTokens,
+                  compactionItemId: undefined,
+                  thinkingItemId: undefined,
                 };
                 ctx.session = {
                   ...ctx.session,
@@ -1824,6 +2081,8 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
             assistantTextSeen: false,
             toolItems: new Map(),
             maxTokens,
+            compactionItemId: undefined,
+            thinkingItemId: undefined,
           };
           ctx.activeTurn = turn;
           ctx.session = {
@@ -2126,14 +2385,92 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
           return { threadId, turns: mapPiMessagesToTurns(messages) };
         });
 
-      const rollbackThread: PiAdapterShape["rollbackThread"] = () =>
-        Effect.fail(
-          new ProviderAdapterRequestError({
-            provider: PROVIDER,
-            method: "rollbackThread",
-            detail: "pi does not yet support rollback",
-          }),
-        );
+      const rollbackThread: PiAdapterShape["rollbackThread"] = (threadId, numTurns) =>
+        Effect.gen(function* () {
+          if (!Number.isInteger(numTurns) || numTurns < 1) {
+            return yield* new ProviderAdapterValidationError({
+              provider: PROVIDER,
+              operation: "rollbackThread",
+              issue: "numTurns must be a positive integer.",
+            });
+          }
+          const ctx = yield* requireSession(threadId);
+          if (ctx.transport !== "rpc" || !ctx.rpc) {
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "rollbackThread",
+              detail: "pi rollback requires the rpc transport.",
+            });
+          }
+          if (ctx.activeTurn) {
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "rollbackThread",
+              detail:
+                "Cannot rollback while a turn is in flight; interrupt or wait for it to settle.",
+            });
+          }
+
+          // Pi's `get_fork_messages` returns the list of forkable user
+          // messages (oldest → newest) with their entry ids. A `fork
+          // {entryId}` then rewinds the session to before that entry,
+          // returning its text so the user could resubmit it. We pick the
+          // entry N turns back from the tip; N == messages.length means
+          // forking the first user message, which effectively resets the
+          // session.
+          const forkMessagesResult = yield* Effect.promise(() =>
+            ctx.rpc!.call<{
+              messages: ReadonlyArray<{ entryId: string; text?: string }>;
+            }>("get_fork_messages"),
+          );
+          if (!forkMessagesResult.success) {
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "rollbackThread",
+              detail: `pi get_fork_messages failed: ${forkMessagesResult.error}`,
+            });
+          }
+          const messages = Array.isArray(forkMessagesResult.data?.messages)
+            ? forkMessagesResult.data.messages
+            : [];
+          if (numTurns > messages.length) {
+            return yield* new ProviderAdapterValidationError({
+              provider: PROVIDER,
+              operation: "rollbackThread",
+              issue: `Cannot roll back ${numTurns} turns; thread has only ${messages.length} user messages.`,
+            });
+          }
+          const targetIndex = messages.length - numTurns;
+          const targetEntry = messages[targetIndex];
+          if (!targetEntry || typeof targetEntry.entryId !== "string") {
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "rollbackThread",
+              detail: "pi returned a fork message without an entryId.",
+            });
+          }
+
+          const forkResult = yield* Effect.promise(() =>
+            ctx.rpc!.call<{ cancelled?: boolean }>("fork", { entryId: targetEntry.entryId }),
+          );
+          if (!forkResult.success) {
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "rollbackThread",
+              detail: `pi fork failed: ${forkResult.error}`,
+            });
+          }
+          if (forkResult.data?.cancelled === true) {
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "rollbackThread",
+              detail: "pi fork was cancelled by an extension.",
+            });
+          }
+
+          // Re-read the snapshot so the caller sees the rewound state.
+          return yield* readThread(threadId);
+        });
 
       const stopAll: PiAdapterShape["stopAll"] = () =>
         Effect.gen(function* () {
