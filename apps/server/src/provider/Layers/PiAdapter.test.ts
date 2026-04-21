@@ -7,6 +7,7 @@ import { join as pathJoin } from "node:path";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
+  ApprovalRequestId,
   type ProviderRuntimeEvent,
   ThreadId,
   type ToolLifecycleItemType,
@@ -129,10 +130,7 @@ class FakeRpcChildProcess extends EventEmitter {
   respondTo(request: Record<string, unknown>, response: Record<string, unknown>): void {
     const id = request.id;
     const command = request.type;
-    this.stdout.emit(
-      "data",
-      `${JSON.stringify({ type: "response", command, id, ...response })}\n`,
-    );
+    this.stdout.emit("data", `${JSON.stringify({ type: "response", command, id, ...response })}\n`);
   }
 
   /** Emit a non-response notification. */
@@ -762,7 +760,9 @@ describe("PiAdapterLive", () => {
 
           // First turn
           const sendPromise1 = Effect.runPromise(
-            adapter.sendTurn({ threadId, input: "hello" }).pipe(Effect.provide(makeTestLayer("rpc"))),
+            adapter
+              .sendTurn({ threadId, input: "hello" })
+              .pipe(Effect.provide(makeTestLayer("rpc"))),
           );
           yield* Effect.sleep(10);
           const frames1 = child.writtenFrames();
@@ -782,7 +782,9 @@ describe("PiAdapterLive", () => {
 
           // Second turn — same child, not a new spawn
           const sendPromise2 = Effect.runPromise(
-            adapter.sendTurn({ threadId, input: "second" }).pipe(Effect.provide(makeTestLayer("rpc"))),
+            adapter
+              .sendTurn({ threadId, input: "second" })
+              .pipe(Effect.provide(makeTestLayer("rpc"))),
           );
           yield* Effect.sleep(10);
           assert.equal(rpcChildren.length, 1, "no second spawn for second turn");
@@ -823,7 +825,9 @@ describe("PiAdapterLive", () => {
           const child = rpcChildren[0]!;
 
           const sendPromise = Effect.runPromise(
-            adapter.sendTurn({ threadId, input: "long task" }).pipe(Effect.provide(makeTestLayer("rpc"))),
+            adapter
+              .sendTurn({ threadId, input: "long task" })
+              .pipe(Effect.provide(makeTestLayer("rpc"))),
           );
           yield* Effect.sleep(10);
           const promptFrame = child.writtenFrames().find((f) => f.type === "prompt")!;
@@ -870,7 +874,9 @@ describe("PiAdapterLive", () => {
           yield* Effect.sleep(0);
 
           const sendPromise = Effect.runPromise(
-            adapter.sendTurn({ threadId, input: "estimate" }).pipe(Effect.provide(makeTestLayer("rpc"))),
+            adapter
+              .sendTurn({ threadId, input: "estimate" })
+              .pipe(Effect.provide(makeTestLayer("rpc"))),
           );
           yield* Effect.sleep(10);
           const promptFrame = child.writtenFrames().find((f) => f.type === "prompt")!;
@@ -963,12 +969,14 @@ describe("PiAdapterLive", () => {
               .pipe(Effect.provide(attachLayer)),
           );
           yield* Effect.sleep(20);
-          const promptFrame = child
-            .writtenFrames()
-            .find((f) => f.type === "prompt") as {
+          const promptFrame = child.writtenFrames().find((f) => f.type === "prompt") as {
             readonly type: string;
             readonly message: string;
-            readonly images?: ReadonlyArray<{ readonly type: string; readonly data: string; readonly mimeType: string }>;
+            readonly images?: ReadonlyArray<{
+              readonly type: string;
+              readonly data: string;
+              readonly mimeType: string;
+            }>;
           };
           assert.ok(promptFrame, "prompt frame should be written");
           assert.ok(Array.isArray(promptFrame.images), "prompt frame should include images[]");
@@ -1126,7 +1134,9 @@ describe("PiAdapterLive", () => {
           const child = rpcChildren[0]!;
 
           const sendPromise = Effect.runPromise(
-            adapter.sendTurn({ threadId, input: "ping" }).pipe(Effect.provide(makeTestLayer("rpc"))),
+            adapter
+              .sendTurn({ threadId, input: "ping" })
+              .pipe(Effect.provide(makeTestLayer("rpc"))),
           );
           yield* Effect.sleep(10);
           const promptFrame = child.writtenFrames().find((f) => f.type === "prompt")!;
@@ -1174,16 +1184,16 @@ describe("PiAdapterLive", () => {
           const child = rpcChildren[0]!;
 
           const firstTurn = Effect.runPromise(
-            adapter.sendTurn({ threadId, input: "first" }).pipe(Effect.provide(makeTestLayer("rpc"))),
+            adapter
+              .sendTurn({ threadId, input: "first" })
+              .pipe(Effect.provide(makeTestLayer("rpc"))),
           );
           yield* Effect.sleep(10);
           const firstPrompt = child.writtenFrames().find((f) => f.type === "prompt")!;
           child.respondTo(firstPrompt, { success: true });
           // Do NOT emit turn_end yet — keep the turn in flight.
 
-          const attempt = yield* adapter
-            .sendTurn({ threadId, input: "second" })
-            .pipe(Effect.flip);
+          const attempt = yield* adapter.sendTurn({ threadId, input: "second" }).pipe(Effect.flip);
           assert.equal(attempt._tag, "ProviderAdapterRequestError");
 
           // Settle the first turn so the fiber drains.
@@ -1353,7 +1363,9 @@ describe("PiAdapterLive", () => {
           yield* Effect.sleep(0);
 
           const turnPromise = Effect.runPromise(
-            adapter.sendTurn({ threadId, input: "long task" }).pipe(Effect.provide(makeTestLayer("rpc"))),
+            adapter
+              .sendTurn({ threadId, input: "long task" })
+              .pipe(Effect.provide(makeTestLayer("rpc"))),
           );
           yield* Effect.sleep(10);
           const promptFrame = child.writtenFrames().find((f) => f.type === "prompt")!;
@@ -1489,7 +1501,8 @@ describe("PiAdapterLive", () => {
           // Pi rejects with its real error string.
           child.respondTo(promptFrame, {
             success: false,
-            error: "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
+            error:
+              "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
           });
           yield* Effect.promise(() => sendPromise);
 
@@ -1563,12 +1576,12 @@ describe("PiAdapterLive", () => {
       );
     });
 
-    it("surfaces runtime.warning and auto-cancels extension_ui_request dialogs", async () => {
+    it("bridges confirm → request.opened → respondToRequest → extension_ui_response", async () => {
       await Effect.runPromise(
         Effect.gen(function* () {
           const { rpcChildren } = installRpcSpawnMock();
           const adapter = yield* PiAdapter;
-          const threadId = asThreadId("thread-pi-rpc-ext-ui");
+          const threadId = asThreadId("thread-pi-rpc-ext-confirm");
 
           yield* adapter.startSession({
             provider: "pi",
@@ -1585,25 +1598,180 @@ describe("PiAdapterLive", () => {
 
           child.notify({
             type: "extension_ui_request",
-            id: "ext-req-1",
+            id: "ext-req-confirm-1",
             method: "confirm",
-            title: "Allow?",
-            message: "Proceed?",
+            title: "Allow command?",
+            message: "Run `rm -rf dist`?",
           });
           yield* Effect.sleep(10);
 
-          const events = yield* joinEvents(eventsFiber);
-          const warn = events.find((e) => e.type === "runtime.warning");
-          assert.ok(warn, "extension_ui_request should surface a runtime.warning");
-          if (warn?.type !== "runtime.warning") throw new Error();
-          assert.match(warn.payload.message, /extension requested 'confirm'/);
+          // The adapter surfaces the confirm as a request.opened with a
+          // Workbench-owned requestId (different from pi's id). Respond with
+          // `accept` and observe both the resolved event and the wire frame
+          // back to pi.
+          const eventsSoFar = yield* adapter.streamEvents.pipe(Stream.take(0), Stream.runCollect);
+          void eventsSoFar; // discard — we gather via joinEvents below
 
-          const cancelFrame = child
+          const session = yield* adapter.listSessions();
+          void session;
+
+          // Fish the workbench requestId back out of the stream.
+          // Stream.take(2) above is racing with our emits; we poll adapter
+          // state via the fiber at the end.
+
+          // Answer the request with `accept`.
+          // We need the Workbench requestId from the emitted event. Read it
+          // out of the collected events by the time the fiber joins.
+          const collected = yield* joinEvents(eventsFiber);
+          const opened = collected.find((e) => e.type === "request.opened");
+          assert.ok(opened, "request.opened should have been emitted");
+          if (opened?.type !== "request.opened") throw new Error();
+          assert.equal(opened.payload.requestType, "dynamic_tool_call");
+          const workbenchReqId = opened.requestId;
+          assert.ok(workbenchReqId);
+
+          yield* adapter.respondToRequest(
+            threadId,
+            ApprovalRequestId.make(String(workbenchReqId)),
+            "accept",
+          );
+          yield* Effect.sleep(5);
+
+          const responseFrame = child
             .writtenFrames()
             .find((f) => f.type === "extension_ui_response");
-          assert.ok(cancelFrame, "should auto-send extension_ui_response for dialog methods");
-          assert.equal(cancelFrame?.id, "ext-req-1");
-          assert.equal(cancelFrame?.cancelled, true);
+          assert.ok(responseFrame, "adapter should send extension_ui_response");
+          assert.equal(responseFrame?.id, "ext-req-confirm-1");
+          assert.equal(responseFrame?.confirmed, true);
+        }).pipe(Effect.provide(makeTestLayer("rpc"))),
+      );
+    });
+
+    it("bridges select → user-input.requested → respondToUserInput → extension_ui_response", async () => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const { rpcChildren } = installRpcSpawnMock();
+          const adapter = yield* PiAdapter;
+          const threadId = asThreadId("thread-pi-rpc-ext-select");
+
+          yield* adapter.startSession({
+            provider: "pi",
+            threadId,
+            runtimeMode: "full-access",
+          });
+          yield* Effect.sleep(10);
+          const child = rpcChildren[0]!;
+
+          const eventsFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 1)).pipe(
+            Effect.forkChild,
+          );
+          yield* Effect.sleep(0);
+
+          child.notify({
+            type: "extension_ui_request",
+            id: "ext-req-sel-1",
+            method: "select",
+            title: "Pick branch",
+            message: "Which branch?",
+            options: ["main", "dev"],
+          });
+          yield* Effect.sleep(10);
+
+          const collected = yield* joinEvents(eventsFiber);
+          const requested = collected.find((e) => e.type === "user-input.requested");
+          assert.ok(requested, "user-input.requested should have been emitted");
+          if (requested?.type !== "user-input.requested") throw new Error();
+          assert.equal(requested.payload.questions.length, 1);
+          const question = requested.payload.questions[0]!;
+          assert.equal(question.header, "Pick branch");
+          assert.equal(question.options.length, 2);
+          const workbenchReqId = requested.requestId;
+          assert.ok(workbenchReqId);
+
+          yield* adapter.respondToUserInput(
+            threadId,
+            ApprovalRequestId.make(String(workbenchReqId)),
+            { [question.id]: "dev" },
+          );
+          yield* Effect.sleep(5);
+
+          const responseFrame = child
+            .writtenFrames()
+            .find((f) => f.type === "extension_ui_response");
+          assert.ok(responseFrame);
+          assert.equal(responseFrame?.id, "ext-req-sel-1");
+          assert.equal(responseFrame?.value, "dev");
+        }).pipe(Effect.provide(makeTestLayer("rpc"))),
+      );
+    });
+
+    it("maps notify → runtime.warning / runtime.error and setStatus → thread.metadata.updated", async () => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const { rpcChildren } = installRpcSpawnMock();
+          const adapter = yield* PiAdapter;
+          const threadId = asThreadId("thread-pi-rpc-ext-ff");
+
+          yield* adapter.startSession({
+            provider: "pi",
+            threadId,
+            runtimeMode: "full-access",
+          });
+          yield* Effect.sleep(10);
+          const child = rpcChildren[0]!;
+
+          const eventsFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 3)).pipe(
+            Effect.forkChild,
+          );
+          yield* Effect.sleep(0);
+
+          child.notify({
+            type: "extension_ui_request",
+            id: "ext-notify-1",
+            method: "notify",
+            message: "Cache cleared",
+            notifyType: "info",
+          });
+          child.notify({
+            type: "extension_ui_request",
+            id: "ext-notify-2",
+            method: "notify",
+            message: "API quota exceeded",
+            notifyType: "error",
+          });
+          child.notify({
+            type: "extension_ui_request",
+            id: "ext-status-1",
+            method: "setStatus",
+            statusKey: "tests",
+            statusText: "running…",
+          });
+          yield* Effect.sleep(10);
+
+          const collected = yield* joinEvents(eventsFiber);
+          const warn = collected.find(
+            (e) => e.type === "runtime.warning" && /Cache cleared/.test(e.payload.message),
+          );
+          const err = collected.find(
+            (e) => e.type === "runtime.error" && /API quota/.test(e.payload.message),
+          );
+          const meta = collected.find(
+            (e) =>
+              e.type === "thread.metadata.updated" &&
+              e.payload.metadata !== undefined &&
+              (e.payload.metadata as Record<string, unknown>)["pi.status.tests"] === "running…",
+          );
+          assert.ok(warn, "notify(info) should emit runtime.warning");
+          assert.ok(err, "notify(error) should emit runtime.error");
+          assert.ok(meta, "setStatus should emit thread.metadata.updated with pi.status.* key");
+
+          // Fire-and-forget methods must NOT write extension_ui_response.
+          const responses = child.writtenFrames().filter((f) => f.type === "extension_ui_response");
+          assert.equal(
+            responses.length,
+            0,
+            "notify/setStatus should not be acknowledged on the wire",
+          );
         }).pipe(Effect.provide(makeTestLayer("rpc"))),
       );
     });

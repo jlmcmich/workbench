@@ -29,8 +29,13 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 
 import {
+  ApprovalRequestId,
+  type CanonicalRequestType,
   type ChatAttachment,
+  type ProviderApprovalDecision,
+  type ProviderUserInputAnswers,
   RuntimeItemId,
+  RuntimeRequestId,
   EventId,
   type PiTransport,
   type ProviderRuntimeEvent,
@@ -130,6 +135,13 @@ interface PiSessionContext {
   rpcActiveModel: string | undefined;
   /** Max-tokens capacity for the active RPC model, for usage snapshot shaping. */
   rpcMaxTokens: number | undefined;
+  /**
+   * Pending `extension_ui_request` dialogs awaiting a user response. Keyed
+   * by the Workbench-owned ApprovalRequestId we surface upstream; the pi
+   * request id lives inside so `respondToRequest` / `respondToUserInput`
+   * can echo it on `extension_ui_response`.
+   */
+  readonly pendingExtensionRequests: Map<ApprovalRequestId, PiPendingExtensionRequest>;
 }
 
 interface PiToolState {
@@ -139,6 +151,23 @@ interface PiToolState {
   readonly itemType: ToolLifecycleItemType;
   readonly title: string;
   readonly summary: string;
+}
+
+/**
+ * A pi `extension_ui_request` we've surfaced to the user and are waiting
+ * on. Indexed on our side by `ApprovalRequestId`; the `piRequestId` is pi's
+ * own uuid that we must echo back on `extension_ui_response`.
+ *
+ * - `confirm` dialogs respond with `{confirmed: boolean}`.
+ * - `select` / `input` / `editor` dialogs respond with `{value: string}`,
+ *   extracted from the single-question answers shape we emit upstream.
+ */
+type PiExtensionRequestKind = "confirm" | "select" | "input" | "editor";
+interface PiPendingExtensionRequest {
+  readonly piRequestId: string;
+  readonly kind: PiExtensionRequestKind;
+  readonly questionId?: string;
+  readonly requestType: CanonicalRequestType;
 }
 
 function nowIso(): string {
@@ -536,7 +565,9 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
       // relatively slow, so we memoize across the adapter lifetime.
       let modelContextWindow: Map<string, number> | undefined;
       let modelContextWindowPromise: Promise<Map<string, number>> | undefined;
-      const resolveModelContextWindow = async (binaryPath: string): Promise<Map<string, number>> => {
+      const resolveModelContextWindow = async (
+        binaryPath: string,
+      ): Promise<Map<string, number>> => {
         if (modelContextWindow) return modelContextWindow;
         if (!modelContextWindowPromise) {
           modelContextWindowPromise = loadPiModelCatalog({ binaryPath })
@@ -626,6 +657,169 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
           .catch(() => undefined);
       };
 
+      /**
+       * Bridge a pi `extension_ui_request` notification onto the Workbench
+       * runtime event stream. Dialog methods (confirm/select/input/editor)
+       * open a pending request the user can answer via `respondToRequest`
+       * or `respondToUserInput`; fire-and-forget methods (notify, setStatus,
+       * setWidget, setTitle, set_editor_text) map to runtime warnings or
+       * thread metadata updates.
+       */
+      const handleExtensionUiRequest = (ctx: PiSessionContext, raw: Record<string, unknown>) => {
+        const method = asTrimmedString(raw.method);
+        const piRequestId = asTrimmedString(raw.id);
+        const turnId = ctx.activeTurn?.turnId;
+
+        const withTurn = <T extends Record<string, unknown>>(base: T): T =>
+          turnId ? ({ ...base, turnId } as T) : base;
+
+        if (method === "confirm") {
+          if (!piRequestId) return;
+          const title = asTrimmedString(raw.title) ?? "pi requested confirmation";
+          const message = asTrimmedString(raw.message);
+          const workbenchRequestId = ApprovalRequestId.make(randomUUID());
+          ctx.pendingExtensionRequests.set(workbenchRequestId, {
+            piRequestId,
+            kind: "confirm",
+            requestType: "dynamic_tool_call",
+          });
+          void emitPromise({
+            ...withTurn(buildEventBase({ threadId: ctx.threadId, turnId })),
+            type: "request.opened",
+            requestId: RuntimeRequestId.make(workbenchRequestId),
+            payload: {
+              requestType: "dynamic_tool_call",
+              ...(message ? { detail: `${title}: ${message}` } : { detail: title }),
+              args: { source: "pi.extension.confirm", title, message },
+            },
+          }).catch(() => undefined);
+          return;
+        }
+
+        if (method === "select" || method === "input" || method === "editor") {
+          if (!piRequestId) return;
+          const title = asTrimmedString(raw.title) ?? `pi requested ${method}`;
+          const prompt = asTrimmedString(raw.message) ?? asTrimmedString(raw.placeholder) ?? title;
+          const workbenchRequestId = ApprovalRequestId.make(randomUUID());
+          const questionId = `pi-ext-${randomUUID()}`;
+          const rawOptions = Array.isArray(raw.options) ? raw.options : [];
+          const options = rawOptions.flatMap((entry) => {
+            const label =
+              typeof entry === "string"
+                ? entry
+                : asTrimmedString((entry as { label?: unknown })?.label);
+            if (!label) return [];
+            return [{ label, description: label }];
+          });
+          ctx.pendingExtensionRequests.set(workbenchRequestId, {
+            piRequestId,
+            kind: method,
+            questionId,
+            // User-input requests reuse the dynamic_tool_call classification
+            // since there's no dedicated CanonicalRequestType for free-form
+            // input; the UI renders based on the user-input.requested event,
+            // not this field.
+            requestType: "tool_user_input",
+          });
+          void emitPromise({
+            ...withTurn(buildEventBase({ threadId: ctx.threadId, turnId })),
+            type: "user-input.requested",
+            requestId: RuntimeRequestId.make(workbenchRequestId),
+            payload: {
+              questions: [
+                {
+                  id: questionId,
+                  header: title,
+                  question: prompt,
+                  options,
+                  multiSelect: false,
+                },
+              ],
+            },
+          }).catch(() => undefined);
+          return;
+        }
+
+        if (method === "notify") {
+          const message =
+            asTrimmedString(raw.message) ?? asTrimmedString(raw.text) ?? "pi extension notice";
+          const notifyType = asTrimmedString(raw.notifyType);
+          const eventType = notifyType === "error" ? "runtime.error" : "runtime.warning";
+          void emitPromise({
+            ...buildEventBase({ threadId: ctx.threadId }),
+            type: eventType,
+            payload: { message },
+          }).catch(() => undefined);
+          return;
+        }
+
+        if (method === "setStatus") {
+          const statusKey = asTrimmedString(raw.statusKey) ?? "default";
+          const statusText = asTrimmedString(raw.statusText) ?? "";
+          void emitPromise({
+            ...buildEventBase({ threadId: ctx.threadId }),
+            type: "thread.metadata.updated",
+            payload: {
+              metadata: { [`pi.status.${statusKey}`]: statusText },
+            },
+          }).catch(() => undefined);
+          return;
+        }
+
+        if (method === "setWidget") {
+          const widgetKey = asTrimmedString(raw.widgetKey) ?? "default";
+          const lines = Array.isArray(raw.widgetLines)
+            ? raw.widgetLines.filter((line): line is string => typeof line === "string")
+            : [];
+          const placement = asTrimmedString(raw.widgetPlacement) ?? "aboveEditor";
+          void emitPromise({
+            ...buildEventBase({ threadId: ctx.threadId }),
+            type: "thread.metadata.updated",
+            payload: {
+              metadata: {
+                [`pi.widgets.${widgetKey}`]: { lines, placement },
+              },
+            },
+          }).catch(() => undefined);
+          return;
+        }
+
+        if (method === "setTitle") {
+          const title = asTrimmedString(raw.title);
+          if (!title) return;
+          void emitPromise({
+            ...buildEventBase({ threadId: ctx.threadId }),
+            type: "thread.metadata.updated",
+            payload: { name: title },
+          }).catch(() => undefined);
+          return;
+        }
+
+        if (method === "set_editor_text") {
+          // No composer-prefill primitive exists on the runtime yet. Surface
+          // a diagnostic warning and ignore. A future phase can route this
+          // into a `composer.prefill` runtime event if/when we add one.
+          const text = asTrimmedString(raw.text);
+          void emitPromise({
+            ...buildEventBase({ threadId: ctx.threadId }),
+            type: "runtime.warning",
+            payload: {
+              message: `pi extension requested composer prefill (set_editor_text, ${text ? `${text.length} chars` : "empty"}); not yet supported.`,
+            },
+          }).catch(() => undefined);
+          return;
+        }
+
+        // Unknown method: warn so surprising behaviour isn't silent.
+        void emitPromise({
+          ...buildEventBase({ threadId: ctx.threadId }),
+          type: "runtime.warning",
+          payload: {
+            message: `pi extension emitted unknown ui method '${method ?? "unknown"}'.`,
+          },
+        }).catch(() => undefined);
+      };
+
       const emitUsageFromMessage = (
         ctx: PiSessionContext,
         turn: PiTurnContext,
@@ -681,39 +875,7 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
           case "attachment":
             return;
           case "extension_ui_request": {
-            // Pi extensions can request interactive UI (confirm/select/input/
-            // editor) or fire-and-forget status (notify/setStatus/setWidget/
-            // setTitle/set_editor_text). The full bridge to our approval and
-            // user-input surfaces lands in Phase 2.4. Until then, surface the
-            // request as a warning so users aren't left wondering why nothing
-            // happened, and immediately answer dialog methods with a
-            // `cancelled: true` response so pi's extension doesn't block on
-            // us waiting for input we won't provide.
-            const method = asTrimmedString(raw.method) ?? "unknown";
-            const requestId = asTrimmedString(raw.id);
-            const isDialog =
-              method === "select" ||
-              method === "confirm" ||
-              method === "input" ||
-              method === "editor";
-            void emitPromise({
-              ...buildEventBase({ threadId: ctx.threadId }),
-              type: "runtime.warning",
-              payload: {
-                message: `pi extension requested '${method}'; this transport doesn't bridge extension UI yet (Phase 2.4). The request was auto-cancelled.`,
-              },
-            }).catch(() => undefined);
-            if (isDialog && requestId && ctx.rpc) {
-              try {
-                ctx.rpc.send({
-                  type: "extension_ui_response",
-                  id: requestId,
-                  cancelled: true,
-                });
-              } catch {
-                // rpc might already be torn down — pi's own timeout handles it.
-              }
-            }
+            handleExtensionUiRequest(ctx, raw);
             return;
           }
         }
@@ -749,7 +911,6 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
           return;
         }
         switch (kind) {
-
           case "plan":
           case "todos": {
             const planSource = Array.isArray(raw.plan)
@@ -1261,8 +1422,7 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
                 }),
             ),
           );
-          const binaryPath =
-            piSettings.binaryPath.trim().length > 0 ? piSettings.binaryPath : "pi";
+          const binaryPath = piSettings.binaryPath.trim().length > 0 ? piSettings.binaryPath : "pi";
           const transport: PiTransport = piSettings.transport;
           const rawModelForSession =
             modelSelection?.model ?? (piSettings.defaultModel || DEFAULT_MODEL);
@@ -1292,14 +1452,12 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
             rpcChild: undefined,
             rpcActiveModel: undefined,
             rpcMaxTokens: undefined,
+            pendingExtensionRequests: new Map(),
           };
 
           if (transport === "rpc") {
-            const capacityMap = yield* Effect.promise(() =>
-              resolveModelContextWindow(binaryPath),
-            );
-            const { provider: rpcProvider, model: rpcModel } =
-              splitPiModelSlug(normalizedModel);
+            const capacityMap = yield* Effect.promise(() => resolveModelContextWindow(binaryPath));
+            const { provider: rpcProvider, model: rpcModel } = splitPiModelSlug(normalizedModel);
             const args: string[] = ["--mode", "rpc"];
             if (rpcProvider) args.push("--provider", rpcProvider);
             args.push("--model", rpcModel);
@@ -1437,7 +1595,8 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
             return yield* new ProviderAdapterRequestError({
               provider: PROVIDER,
               method: "sendTurn",
-              detail: "A pi turn is already in flight on this thread; wait for it to settle or interrupt.",
+              detail:
+                "A pi turn is already in flight on this thread; wait for it to settle or interrupt.",
             });
           }
 
@@ -1500,9 +1659,7 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
 
             // Refresh max-tokens against the catalog (cheap after first
             // lookup) and compute the target provider/model tuple.
-            const capacityMap = yield* Effect.promise(() =>
-              resolveModelContextWindow(binaryPath),
-            );
+            const capacityMap = yield* Effect.promise(() => resolveModelContextWindow(binaryPath));
             const { provider: rpcProvider, model: rpcModel } = splitPiModelSlug(model);
             const maxTokens = capacityMap.get(rpcModel) ?? capacityMap.get(model);
 
@@ -1781,23 +1938,124 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
           }
         });
 
-      const respondToRequest: PiAdapterShape["respondToRequest"] = () =>
-        Effect.fail(
-          new ProviderAdapterRequestError({
-            provider: PROVIDER,
-            method: "respondToRequest",
-            detail: "pi does not yet support interactive approvals",
-          }),
-        );
+      const respondToRequest: PiAdapterShape["respondToRequest"] = (
+        threadId: ThreadId,
+        requestId: ApprovalRequestId,
+        decision: ProviderApprovalDecision,
+      ) =>
+        Effect.gen(function* () {
+          const ctx = yield* requireSession(threadId);
+          if (ctx.transport !== "rpc" || !ctx.rpc) {
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "respondToRequest",
+              detail: "pi approvals require the rpc transport.",
+            });
+          }
+          const pending = ctx.pendingExtensionRequests.get(requestId);
+          if (!pending) {
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "respondToRequest",
+              detail: `Unknown pending pi extension request: ${requestId}`,
+            });
+          }
+          ctx.pendingExtensionRequests.delete(requestId);
 
-      const respondToUserInput: PiAdapterShape["respondToUserInput"] = () =>
-        Effect.fail(
-          new ProviderAdapterRequestError({
-            provider: PROVIDER,
-            method: "respondToUserInput",
-            detail: "pi does not yet support structured user input",
-          }),
-        );
+          // Map Workbench decisions onto pi's extension_ui_response shape.
+          // accept / acceptForSession → {confirmed:true}
+          // decline                   → {confirmed:false}
+          // cancel                    → {cancelled:true}   (pi extensions
+          //   interpret this as "no answer" and fall back to their default
+          //   behaviour).
+          const responseFrame: Record<string, unknown> = {
+            type: "extension_ui_response",
+            id: pending.piRequestId,
+          };
+          if (decision === "cancel") {
+            responseFrame.cancelled = true;
+          } else if (pending.kind === "confirm") {
+            responseFrame.confirmed = decision === "accept" || decision === "acceptForSession";
+          } else {
+            // select/input/editor shouldn't land here (they flow through
+            // respondToUserInput); if they do, cancel rather than guess.
+            responseFrame.cancelled = true;
+          }
+          ctx.rpc.send(responseFrame);
+
+          const turnId = ctx.activeTurn?.turnId;
+          yield* emit({
+            ...buildEventBase({ threadId: ctx.threadId }),
+            ...(turnId ? { turnId } : {}),
+            type: "request.resolved",
+            requestId: RuntimeRequestId.make(requestId),
+            payload: {
+              requestType: pending.requestType,
+              decision,
+            },
+          });
+        });
+
+      const respondToUserInput: PiAdapterShape["respondToUserInput"] = (
+        threadId: ThreadId,
+        requestId: ApprovalRequestId,
+        answers: ProviderUserInputAnswers,
+      ) =>
+        Effect.gen(function* () {
+          const ctx = yield* requireSession(threadId);
+          if (ctx.transport !== "rpc" || !ctx.rpc) {
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "respondToUserInput",
+              detail: "pi user input requires the rpc transport.",
+            });
+          }
+          const pending = ctx.pendingExtensionRequests.get(requestId);
+          if (!pending || !pending.questionId) {
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "respondToUserInput",
+              detail: `Unknown pending pi extension user-input request: ${requestId}`,
+            });
+          }
+          ctx.pendingExtensionRequests.delete(requestId);
+
+          // Extract the answer for our single synthesized question. Pi
+          // dialogs carry exactly one question each, so we only consume
+          // that entry and ignore anything else the UI may have included.
+          const rawAnswer = (answers as Record<string, unknown>)[pending.questionId];
+          const answerValue =
+            typeof rawAnswer === "string"
+              ? rawAnswer
+              : Array.isArray(rawAnswer) && typeof rawAnswer[0] === "string"
+                ? (rawAnswer[0] as string)
+                : undefined;
+
+          if (answerValue === undefined) {
+            ctx.rpc.send({
+              type: "extension_ui_response",
+              id: pending.piRequestId,
+              cancelled: true,
+            });
+          } else {
+            ctx.rpc.send({
+              type: "extension_ui_response",
+              id: pending.piRequestId,
+              value: answerValue,
+            });
+          }
+
+          const turnId = ctx.activeTurn?.turnId;
+          yield* emit({
+            ...buildEventBase({ threadId: ctx.threadId }),
+            ...(turnId ? { turnId } : {}),
+            type: "user-input.resolved",
+            requestId: RuntimeRequestId.make(requestId),
+            payload: {
+              answers: answers as Record<string, unknown>,
+            },
+          });
+        });
 
       const stopSession: PiAdapterShape["stopSession"] = (threadId) =>
         Effect.gen(function* () {
