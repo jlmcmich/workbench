@@ -2041,6 +2041,168 @@ describe("PiAdapterLive", () => {
       );
     });
 
+    it("rollbackThread forks to the entry N turns back and returns a fresh snapshot", async () => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const { rpcChildren } = installRpcSpawnMock();
+          const adapter = yield* PiAdapter;
+          const threadId = asThreadId("thread-pi-rpc-rollback");
+
+          yield* adapter.startSession({
+            provider: "pi",
+            threadId,
+            runtimeMode: "full-access",
+          });
+          yield* Effect.sleep(10);
+          const child = rpcChildren[0]!;
+
+          const rollbackPromise = Effect.runPromise(
+            adapter
+              .rollbackThread(threadId, 1)
+              .pipe(Effect.provide(makeTestLayer("rpc"))),
+          );
+          yield* Effect.sleep(10);
+
+          // Respond to get_fork_messages with 3 user messages.
+          const forkListFrame = child
+            .writtenFrames()
+            .find((f) => f.type === "get_fork_messages") as Record<string, unknown>;
+          assert.ok(forkListFrame, "expected get_fork_messages frame");
+          child.respondTo(forkListFrame, {
+            success: true,
+            data: {
+              messages: [
+                { entryId: "e1", text: "first" },
+                { entryId: "e2", text: "second" },
+                { entryId: "e3", text: "third" },
+              ],
+            },
+          });
+          yield* Effect.sleep(5);
+
+          // Then respond to fork targeting the tip (numTurns=1 → entryId e3).
+          const forkFrame = child
+            .writtenFrames()
+            .find((f) => f.type === "fork") as Record<string, unknown>;
+          assert.ok(forkFrame, "expected fork frame");
+          assert.equal(forkFrame.entryId, "e3");
+          child.respondTo(forkFrame, { success: true, data: { cancelled: false, text: "third" } });
+          yield* Effect.sleep(5);
+
+          // rollbackThread then calls readThread → get_messages. Respond with a shorter list.
+          const getMessagesFrame = child
+            .writtenFrames()
+            .find((f) => f.type === "get_messages") as Record<string, unknown>;
+          assert.ok(getMessagesFrame, "expected get_messages frame after fork");
+          child.respondTo(getMessagesFrame, {
+            success: true,
+            data: {
+              messages: [
+                {
+                  id: "e1",
+                  timestamp: "2026-04-21T00:00:01Z",
+                  message: { role: "user", content: "first", timestamp: 1 },
+                },
+                {
+                  id: "e2",
+                  timestamp: "2026-04-21T00:00:02Z",
+                  message: { role: "user", content: "second", timestamp: 2 },
+                },
+              ],
+            },
+          });
+
+          const snapshot = yield* Effect.promise(() => rollbackPromise);
+          assert.equal(snapshot.threadId, threadId);
+          assert.equal(snapshot.turns.length, 2);
+        }).pipe(Effect.provide(makeTestLayer("rpc"))),
+      );
+    });
+
+    it("rollbackThread rejects numTurns larger than available messages", async () => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const { rpcChildren } = installRpcSpawnMock();
+          const adapter = yield* PiAdapter;
+          const threadId = asThreadId("thread-pi-rpc-rollback-overflow");
+
+          yield* adapter.startSession({
+            provider: "pi",
+            threadId,
+            runtimeMode: "full-access",
+          });
+          yield* Effect.sleep(10);
+          const child = rpcChildren[0]!;
+
+          const rollbackPromise = Effect.runPromise(
+            adapter
+              .rollbackThread(threadId, 5)
+              .pipe(Effect.provide(makeTestLayer("rpc")))
+              .pipe(Effect.flip),
+          );
+          yield* Effect.sleep(10);
+
+          const forkListFrame = child
+            .writtenFrames()
+            .find((f) => f.type === "get_fork_messages") as Record<string, unknown>;
+          child.respondTo(forkListFrame, {
+            success: true,
+            data: { messages: [{ entryId: "e1", text: "only" }] },
+          });
+
+          const err = yield* Effect.promise(() => rollbackPromise);
+          assert.equal(err._tag, "ProviderAdapterValidationError");
+          assert.equal(
+            child.writtenFrames().some((f) => f.type === "fork"),
+            false,
+            "fork must not be called when numTurns exceeds available messages",
+          );
+        }).pipe(Effect.provide(makeTestLayer("rpc"))),
+      );
+    });
+
+    it("rollbackThread refuses while a turn is in flight", async () => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const { rpcChildren } = installRpcSpawnMock();
+          const adapter = yield* PiAdapter;
+          const threadId = asThreadId("thread-pi-rpc-rollback-busy");
+
+          yield* adapter.startSession({
+            provider: "pi",
+            threadId,
+            runtimeMode: "full-access",
+          });
+          yield* Effect.sleep(10);
+          const child = rpcChildren[0]!;
+
+          const turnPromise = Effect.runPromise(
+            adapter.sendTurn({ threadId, input: "go" }).pipe(Effect.provide(makeTestLayer("rpc"))),
+          );
+          yield* Effect.sleep(10);
+          const promptFrame = child.writtenFrames().find((f) => f.type === "prompt")!;
+          child.respondTo(promptFrame, { success: true });
+          // Don't settle the turn yet — it's "in flight" from our POV.
+
+          const err = yield* adapter
+            .rollbackThread(threadId, 1)
+            .pipe(Effect.flip);
+          assert.equal(err._tag, "ProviderAdapterRequestError");
+
+          // Drain the turn so the fiber cleans up.
+          child.notify({
+            type: "turn_end",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "done" }],
+              stopReason: "stop",
+            },
+          });
+          yield* Effect.promise(() => turnPromise);
+        }).pipe(Effect.provide(makeTestLayer("rpc"))),
+      );
+    });
+
     it("readThread returns empty turns in json transport", async () => {
       await Effect.runPromise(
         Effect.gen(function* () {

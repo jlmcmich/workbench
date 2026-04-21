@@ -2309,14 +2309,92 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
           return { threadId, turns: mapPiMessagesToTurns(messages) };
         });
 
-      const rollbackThread: PiAdapterShape["rollbackThread"] = () =>
-        Effect.fail(
-          new ProviderAdapterRequestError({
-            provider: PROVIDER,
-            method: "rollbackThread",
-            detail: "pi does not yet support rollback",
-          }),
-        );
+      const rollbackThread: PiAdapterShape["rollbackThread"] = (threadId, numTurns) =>
+        Effect.gen(function* () {
+          if (!Number.isInteger(numTurns) || numTurns < 1) {
+            return yield* new ProviderAdapterValidationError({
+              provider: PROVIDER,
+              operation: "rollbackThread",
+              issue: "numTurns must be a positive integer.",
+            });
+          }
+          const ctx = yield* requireSession(threadId);
+          if (ctx.transport !== "rpc" || !ctx.rpc) {
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "rollbackThread",
+              detail: "pi rollback requires the rpc transport.",
+            });
+          }
+          if (ctx.activeTurn) {
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "rollbackThread",
+              detail:
+                "Cannot rollback while a turn is in flight; interrupt or wait for it to settle.",
+            });
+          }
+
+          // Pi's `get_fork_messages` returns the list of forkable user
+          // messages (oldest → newest) with their entry ids. A `fork
+          // {entryId}` then rewinds the session to before that entry,
+          // returning its text so the user could resubmit it. We pick the
+          // entry N turns back from the tip; N == messages.length means
+          // forking the first user message, which effectively resets the
+          // session.
+          const forkMessagesResult = yield* Effect.promise(() =>
+            ctx.rpc!.call<{
+              messages: ReadonlyArray<{ entryId: string; text?: string }>;
+            }>("get_fork_messages"),
+          );
+          if (!forkMessagesResult.success) {
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "rollbackThread",
+              detail: `pi get_fork_messages failed: ${forkMessagesResult.error}`,
+            });
+          }
+          const messages = Array.isArray(forkMessagesResult.data?.messages)
+            ? forkMessagesResult.data.messages
+            : [];
+          if (numTurns > messages.length) {
+            return yield* new ProviderAdapterValidationError({
+              provider: PROVIDER,
+              operation: "rollbackThread",
+              issue: `Cannot roll back ${numTurns} turns; thread has only ${messages.length} user messages.`,
+            });
+          }
+          const targetIndex = messages.length - numTurns;
+          const targetEntry = messages[targetIndex];
+          if (!targetEntry || typeof targetEntry.entryId !== "string") {
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "rollbackThread",
+              detail: "pi returned a fork message without an entryId.",
+            });
+          }
+
+          const forkResult = yield* Effect.promise(() =>
+            ctx.rpc!.call<{ cancelled?: boolean }>("fork", { entryId: targetEntry.entryId }),
+          );
+          if (!forkResult.success) {
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "rollbackThread",
+              detail: `pi fork failed: ${forkResult.error}`,
+            });
+          }
+          if (forkResult.data?.cancelled === true) {
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "rollbackThread",
+              detail: "pi fork was cancelled by an extension.",
+            });
+          }
+
+          // Re-read the snapshot so the caller sees the rewound state.
+          return yield* readThread(threadId);
+        });
 
       const stopAll: PiAdapterShape["stopAll"] = () =>
         Effect.gen(function* () {
