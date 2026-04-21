@@ -1653,12 +1653,23 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
                 Effect.catch(() => Effect.succeed(undefined)),
               );
             if (storedRecord !== undefined) {
+              // Pi's switch_session loads the session JSONL from disk, and
+              // on real sessions with lots of history that can take longer
+              // than the 2s we originally allowed — real users were hitting
+              // the timeout on healthy sessions and landing in a
+              // "starting fresh" state that then ran a whole new turn from
+              // scratch. 30s is generous enough to cover a reasonable range
+              // of session sizes without letting a genuinely hung pi stall
+              // startSession indefinitely.
+              const SWITCH_SESSION_TIMEOUT_MS = 30_000;
               const switchResult = yield* Effect.promise(() =>
                 Promise.race([
                   ctx.rpc!.call<{ cancelled?: boolean }>("switch_session", {
                     sessionPath: storedRecord.sessionFile,
                   }),
-                  new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 2_000)),
+                  new Promise<"timeout">((resolve) =>
+                    setTimeout(() => resolve("timeout"), SWITCH_SESSION_TIMEOUT_MS),
+                  ),
                 ]),
               );
               if (switchResult === "timeout") {
@@ -1666,7 +1677,7 @@ export function makePiAdapterLive(options?: PiAdapterLiveOptions) {
                   ...buildEventBase({ threadId: input.threadId }),
                   type: "runtime.warning",
                   payload: {
-                    message: `pi did not respond to switch_session (${storedRecord.sessionFile}); starting fresh.`,
+                    message: `pi did not respond to switch_session within ${SWITCH_SESSION_TIMEOUT_MS / 1000}s (${storedRecord.sessionFile}); starting fresh.`,
                   },
                 });
               } else if (!switchResult.success) {
