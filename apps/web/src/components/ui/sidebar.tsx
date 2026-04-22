@@ -28,6 +28,18 @@ const SIDEBAR_WIDTH_MOBILE = "calc(100vw - var(--spacing(3)))";
 const SIDEBAR_WIDTH_ICON = "3rem";
 const SIDEBAR_RESIZE_DEFAULT_MIN_WIDTH = 16 * 16;
 
+type SidebarResizeConstraintContext = {
+  rail: HTMLButtonElement;
+  side: "left" | "right";
+  sidebarRoot: HTMLElement;
+  wrapper: HTMLElement;
+};
+
+type SidebarResizeAcceptanceContext = SidebarResizeConstraintContext & {
+  currentWidth: number;
+  nextWidth: number;
+};
+
 type SidebarContextProps = {
   state: "expanded" | "collapsed";
   open: boolean;
@@ -42,14 +54,7 @@ type SidebarResizableOptions = {
   maxWidth?: number;
   minWidth?: number;
   onResize?: (width: number) => void;
-  shouldAcceptWidth?: (context: {
-    currentWidth: number;
-    nextWidth: number;
-    rail: HTMLButtonElement;
-    side: "left" | "right";
-    sidebarRoot: HTMLElement;
-    wrapper: HTMLElement;
-  }) => boolean;
+  shouldAcceptWidth?: (context: SidebarResizeAcceptanceContext) => boolean;
   storageKey?: string;
 };
 
@@ -57,14 +62,7 @@ type SidebarResolvedResizableOptions = {
   maxWidth: number;
   minWidth: number;
   onResize?: (width: number) => void;
-  shouldAcceptWidth?: (context: {
-    currentWidth: number;
-    nextWidth: number;
-    rail: HTMLButtonElement;
-    side: "left" | "right";
-    sidebarRoot: HTMLElement;
-    wrapper: HTMLElement;
-  }) => boolean;
+  shouldAcceptWidth?: (context: SidebarResizeAcceptanceContext) => boolean;
   storageKey: string | null;
 };
 
@@ -329,6 +327,49 @@ function clampSidebarWidth(width: number, options: SidebarResolvedResizableOptio
   return Math.max(options.minWidth, Math.min(width, options.maxWidth));
 }
 
+export function resolveAcceptedSidebarWidth({
+  currentWidth,
+  desiredWidth,
+  options,
+  ...context
+}: SidebarResizeConstraintContext & {
+  currentWidth: number;
+  desiredWidth: number;
+  options: SidebarResolvedResizableOptions;
+}): number {
+  const clampedDesiredWidth = clampSidebarWidth(desiredWidth, options);
+  if (!options.shouldAcceptWidth) {
+    return clampedDesiredWidth;
+  }
+
+  const acceptsWidth = (nextWidth: number) =>
+    options.shouldAcceptWidth?.({
+      currentWidth,
+      nextWidth,
+      ...context,
+    }) ?? true;
+
+  if (acceptsWidth(clampedDesiredWidth)) {
+    return clampedDesiredWidth;
+  }
+
+  let low = options.minWidth;
+  let high = clampedDesiredWidth;
+  let acceptedWidth = options.minWidth;
+
+  while (low <= high) {
+    const candidate = Math.floor((low + high) / 2);
+    if (acceptsWidth(candidate)) {
+      acceptedWidth = candidate;
+      low = candidate + 1;
+    } else {
+      high = candidate - 1;
+    }
+  }
+
+  return acceptedWidth;
+}
+
 function SidebarRail({
   className,
   onClick,
@@ -360,6 +401,65 @@ function SidebarRail({
   const canResize = resolvedResizable !== null && open;
   const railLabel = canResize ? "Resize Sidebar" : "Toggle Sidebar";
   const railTitle = canResize ? "Drag to resize sidebar" : "Toggle Sidebar";
+  const syncSidebarWidth = React.useCallback(
+    ({
+      desiredWidth,
+      notify = false,
+      shrinkOnly = false,
+    }: {
+      desiredWidth?: number;
+      notify?: boolean;
+      shrinkOnly?: boolean;
+    } = {}) => {
+      if (!resolvedResizable) {
+        return null;
+      }
+
+      const rail = railRef.current;
+      if (!rail) {
+        return null;
+      }
+
+      const wrapper = rail.closest<HTMLElement>("[data-slot='sidebar-wrapper']");
+      const sidebarRoot = rail.closest<HTMLElement>("[data-slot='sidebar']");
+      if (!wrapper || !sidebarRoot) {
+        return null;
+      }
+
+      const sidebarContainer = sidebarRoot.querySelector<HTMLElement>(
+        "[data-slot='sidebar-container']",
+      );
+      if (!sidebarContainer) {
+        return null;
+      }
+
+      const currentWidth = sidebarContainer.getBoundingClientRect().width;
+      const acceptedWidth = resolveAcceptedSidebarWidth({
+        currentWidth,
+        desiredWidth: desiredWidth ?? currentWidth,
+        options: resolvedResizable,
+        rail,
+        side: sidebarInstance?.side ?? "left",
+        sidebarRoot,
+        wrapper,
+      });
+      const widthChanged = Math.abs(acceptedWidth - currentWidth) >= 0.5;
+      if (shrinkOnly && acceptedWidth > currentWidth) {
+        return currentWidth;
+      }
+      if (!widthChanged) {
+        if (notify) {
+          resolvedResizable.onResize?.(acceptedWidth);
+        }
+        return currentWidth;
+      }
+
+      wrapper.style.setProperty("--sidebar-width", `${acceptedWidth}px`);
+      resolvedResizable.onResize?.(acceptedWidth);
+      return acceptedWidth;
+    },
+    [resolvedResizable, sidebarInstance?.side],
+  );
 
   const stopResize = React.useCallback(
     (pointerId: number) => {
@@ -469,21 +569,17 @@ function SidebarRail({
 
         activeResizeState.rafId = null;
         const nextWidth = activeResizeState.pendingWidth;
-        const accepted =
-          resolvedResizable.shouldAcceptWidth?.({
-            currentWidth: activeResizeState.width,
-            nextWidth,
-            rail: activeResizeState.rail,
-            side: activeResizeState.side,
-            sidebarRoot: activeResizeState.sidebarRoot,
-            wrapper: activeResizeState.wrapper,
-          }) ?? true;
-        if (!accepted) {
-          return;
-        }
-
-        activeResizeState.wrapper.style.setProperty("--sidebar-width", `${nextWidth}px`);
-        activeResizeState.width = nextWidth;
+        const acceptedWidth = resolveAcceptedSidebarWidth({
+          currentWidth: activeResizeState.width,
+          desiredWidth: nextWidth,
+          options: resolvedResizable,
+          rail: activeResizeState.rail,
+          side: activeResizeState.side,
+          sidebarRoot: activeResizeState.sidebarRoot,
+          wrapper: activeResizeState.wrapper,
+        });
+        activeResizeState.wrapper.style.setProperty("--sidebar-width", `${acceptedWidth}px`);
+        activeResizeState.width = acceptedWidth;
       });
     },
     [onPointerMove, resolvedResizable],
@@ -538,18 +634,40 @@ function SidebarRail({
   );
 
   React.useEffect(() => {
-    if (!resolvedResizable?.storageKey || typeof window === "undefined") return;
-    const rail = railRef.current;
-    if (!rail) return;
-    const wrapper = rail.closest<HTMLElement>("[data-slot='sidebar-wrapper']");
-    if (!wrapper) return;
+    if (!resolvedResizable) return;
 
-    const storedWidth = getLocalStorageItem(resolvedResizable.storageKey, Schema.Finite);
-    if (storedWidth === null) return;
-    const clampedWidth = clampSidebarWidth(storedWidth, resolvedResizable);
-    wrapper.style.setProperty("--sidebar-width", `${clampedWidth}px`);
-    resolvedResizable.onResize?.(clampedWidth);
-  }, [resolvedResizable]);
+    const storedWidth =
+      typeof window !== "undefined" && resolvedResizable.storageKey
+        ? getLocalStorageItem(resolvedResizable.storageKey, Schema.Finite)
+        : null;
+    syncSidebarWidth(
+      storedWidth === null
+        ? undefined
+        : {
+            desiredWidth: storedWidth,
+            notify: true,
+          },
+    );
+
+    if (typeof ResizeObserver === "undefined") {
+      return;
+    }
+
+    const rail = railRef.current;
+    const wrapper = rail?.closest<HTMLElement>("[data-slot='sidebar-wrapper']");
+    if (!wrapper) {
+      return;
+    }
+
+    const resizeObserver = new ResizeObserver(() => {
+      syncSidebarWidth({ shrinkOnly: true });
+    });
+    resizeObserver.observe(wrapper);
+
+    return () => {
+      resizeObserver.disconnect();
+    };
+  }, [resolvedResizable, syncSidebarWidth]);
 
   React.useEffect(() => {
     return () => {
