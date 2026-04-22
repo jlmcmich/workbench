@@ -257,8 +257,15 @@ const ConsoleRail = memo(function ConsoleRail({
   // Pick a sensible default selection when the panel opens or the project
   // changes. We only *clear* an existing selection if we have positive
   // evidence the path is gone — otherwise an externally-set focusedPath can
-  // get clobbered before the entries query loads.
+  // get clobbered before the entries query loads. In viewerOnly mode the
+  // URL-supplied focusedPath is authoritative, so the fallback never runs;
+  // otherwise a workspace with any artifacts but no entries yet would fail
+  // the stillExists check (artifacts only covers agent-touched files) and
+  // clobber the focused selection with an alphabetically-first file.
   useEffect(() => {
+    if (viewerOnly) {
+      return;
+    }
     if (selectedPath) {
       const haveEntriesData = !!workspaceEntriesQuery.data;
       const haveArtifacts = artifacts.length > 0;
@@ -278,7 +285,7 @@ const ConsoleRail = memo(function ConsoleRail({
         firstFilePath(workspaceEntriesQuery.data?.entries) ??
         null,
     );
-  }, [artifacts, recentArtifacts, selectedPath, workspaceEntriesQuery.data]);
+  }, [artifacts, recentArtifacts, selectedPath, viewerOnly, workspaceEntriesQuery.data]);
 
   // Honor an external "focus this file" request from chat links — open the
   // viewer takeover so the file is immediately readable.
