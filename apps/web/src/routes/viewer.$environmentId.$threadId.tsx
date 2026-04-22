@@ -24,7 +24,7 @@ function ThreadViewerRouteView() {
   );
 }
 
-export const Route = createFileRoute("/_viewer/$environmentId/$threadId")({
+export const Route = createFileRoute("/viewer/$environmentId/$threadId")({
   validateSearch: (search) => parseViewerWindowRouteSearch(search),
   component: ThreadViewerRouteView,
 });

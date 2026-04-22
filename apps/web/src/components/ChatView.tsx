@@ -1935,7 +1935,8 @@ export default function ChatView(props: ChatViewProps) {
         return;
       }
 
-      const targetPath = resolveWorkspaceSelectionPath(input.path, activeWorkspaceRoot) ?? input.path;
+      const targetPath =
+        resolveWorkspaceSelectionPath(input.path, activeWorkspaceRoot) ?? input.path;
       const targetUrl = new URL(
         buildViewerWindowPath(
           routeKind === "draft" && draftId
@@ -3630,7 +3631,7 @@ export default function ChatView(props: ChatViewProps) {
                   threadId={activeThread.id}
                   mode="sidebar"
                   expanded={consoleRailExpanded}
-                  onPopOutViewer={({ path, mode }) => openDocumentViewerWindow({ path, mode })}
+                  onPopOutViewer={handlePopOutViewerRequest}
                   onToggleExpanded={toggleConsoleRailExpanded}
                   onViewerOverlayOpenChange={handleConsoleViewerOverlayOpenChange}
                   onClose={closePlanSidebar}
@@ -3680,7 +3681,7 @@ export default function ChatView(props: ChatViewProps) {
             focusedPath={workspacePanelFocusedPath}
             threadId={activeThread.id}
             mode="sheet"
-            onPopOutViewer={({ path, mode }) => openDocumentViewerWindow({ path, mode })}
+            onPopOutViewer={handlePopOutViewerRequest}
             onViewerOverlayOpenChange={handleConsoleViewerOverlayOpenChange}
             onClose={closePlanSidebar}
             onOpenTurnDiff={onOpenTurnDiff}

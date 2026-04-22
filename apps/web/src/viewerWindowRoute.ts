@@ -31,8 +31,8 @@ export function buildViewerWindowPath(
 ): string {
   const pathname =
     target.routeKind === "server"
-      ? `/_viewer/${encodeURIComponent(target.environmentId)}/${encodeURIComponent(target.threadId)}`
-      : `/_viewer/draft/${encodeURIComponent(target.draftId)}`;
+      ? `/viewer/${encodeURIComponent(target.environmentId)}/${encodeURIComponent(target.threadId)}`
+      : `/viewer/draft/${encodeURIComponent(target.draftId)}`;
   const params = new URLSearchParams();
   if (search.path) {
     params.set("path", search.path);

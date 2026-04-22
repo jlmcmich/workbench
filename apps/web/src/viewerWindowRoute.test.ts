@@ -30,7 +30,7 @@ describe("viewerWindowRoute", () => {
           mode: "edit",
         },
       ),
-    ).toBe("/_viewer/environment-local/thread-123?path=docs%2Fspec.md&mode=edit");
+    ).toBe("/viewer/environment-local/thread-123?path=docs%2Fspec.md&mode=edit");
   });
 
   it("builds a draft viewer window path", () => {
@@ -45,6 +45,6 @@ describe("viewerWindowRoute", () => {
           mode: "preview",
         },
       ),
-    ).toBe("/_viewer/draft/draft-123?path=docs%2Fspec.md");
+    ).toBe("/viewer/draft/draft-123?path=docs%2Fspec.md");
   });
 });

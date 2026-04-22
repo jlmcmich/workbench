@@ -459,7 +459,7 @@ function getSafeAppWindowUrl(rawUrl: unknown): string | null {
     return null;
   }
 
-  if (!parsedUrl.pathname.startsWith("/_viewer/")) {
+  if (!parsedUrl.pathname.startsWith("/viewer/")) {
     return null;
   }
 

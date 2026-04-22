@@ -148,12 +148,8 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
             <PlusIcon className="size-3.5" />
           </MenuTrigger>
           <MenuPopup align="end" side="top">
-            <MenuItem onClick={() => onQueue("steer")}>
-              Steer current turn
-            </MenuItem>
-            <MenuItem onClick={() => onQueue("followUp")}>
-              Queue as follow-up
-            </MenuItem>
+            <MenuItem onClick={() => onQueue("steer")}>Steer current turn</MenuItem>
+            <MenuItem onClick={() => onQueue("followUp")}>Queue as follow-up</MenuItem>
           </MenuPopup>
         </Menu>
         {stopButton}

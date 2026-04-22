@@ -72,7 +72,7 @@ export const Route = createRootRouteWithContext<{
 function RootRouteView() {
   const pathname = useLocation({ select: (location) => location.pathname });
   const { authGateState } = Route.useRouteContext();
-  const isViewerWindowRoute = pathname.startsWith("/_viewer/");
+  const isViewerWindowRoute = pathname.startsWith("/viewer/");
 
   useEffect(() => {
     const frame = window.requestAnimationFrame(() => {

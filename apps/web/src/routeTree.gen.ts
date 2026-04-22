@@ -16,6 +16,8 @@ import { Route as ChatIndexRouteImport } from './routes/_chat.index'
 import { Route as SettingsGeneralRouteImport } from './routes/settings.general'
 import { Route as SettingsConnectionsRouteImport } from './routes/settings.connections'
 import { Route as SettingsArchivedRouteImport } from './routes/settings.archived'
+import { Route as ViewerDraftDraftIdRouteImport } from './routes/viewer.draft.$draftId'
+import { Route as ViewerEnvironmentIdThreadIdRouteImport } from './routes/viewer.$environmentId.$threadId'
 import { Route as ChatDraftDraftIdRouteImport } from './routes/_chat.draft.$draftId'
 import { Route as ChatEnvironmentIdThreadIdRouteImport } from './routes/_chat.$environmentId.$threadId'
 
@@ -53,6 +55,17 @@ const SettingsArchivedRoute = SettingsArchivedRouteImport.update({
   path: '/archived',
   getParentRoute: () => SettingsRoute,
 } as any)
+const ViewerDraftDraftIdRoute = ViewerDraftDraftIdRouteImport.update({
+  id: '/viewer/draft/$draftId',
+  path: '/viewer/draft/$draftId',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ViewerEnvironmentIdThreadIdRoute =
+  ViewerEnvironmentIdThreadIdRouteImport.update({
+    id: '/viewer/$environmentId/$threadId',
+    path: '/viewer/$environmentId/$threadId',
+    getParentRoute: () => rootRouteImport,
+  } as any)
 const ChatDraftDraftIdRoute = ChatDraftDraftIdRouteImport.update({
   id: '/draft/$draftId',
   path: '/draft/$draftId',
@@ -74,6 +87,8 @@ export interface FileRoutesByFullPath {
   '/settings/general': typeof SettingsGeneralRoute
   '/$environmentId/$threadId': typeof ChatEnvironmentIdThreadIdRoute
   '/draft/$draftId': typeof ChatDraftDraftIdRoute
+  '/viewer/$environmentId/$threadId': typeof ViewerEnvironmentIdThreadIdRoute
+  '/viewer/draft/$draftId': typeof ViewerDraftDraftIdRoute
 }
 export interface FileRoutesByTo {
   '/pair': typeof PairRoute
@@ -84,6 +99,8 @@ export interface FileRoutesByTo {
   '/': typeof ChatIndexRoute
   '/$environmentId/$threadId': typeof ChatEnvironmentIdThreadIdRoute
   '/draft/$draftId': typeof ChatDraftDraftIdRoute
+  '/viewer/$environmentId/$threadId': typeof ViewerEnvironmentIdThreadIdRoute
+  '/viewer/draft/$draftId': typeof ViewerDraftDraftIdRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -96,6 +113,8 @@ export interface FileRoutesById {
   '/_chat/': typeof ChatIndexRoute
   '/_chat/$environmentId/$threadId': typeof ChatEnvironmentIdThreadIdRoute
   '/_chat/draft/$draftId': typeof ChatDraftDraftIdRoute
+  '/viewer/$environmentId/$threadId': typeof ViewerEnvironmentIdThreadIdRoute
+  '/viewer/draft/$draftId': typeof ViewerDraftDraftIdRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -108,6 +127,8 @@ export interface FileRouteTypes {
     | '/settings/general'
     | '/$environmentId/$threadId'
     | '/draft/$draftId'
+    | '/viewer/$environmentId/$threadId'
+    | '/viewer/draft/$draftId'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/pair'
@@ -118,6 +139,8 @@ export interface FileRouteTypes {
     | '/'
     | '/$environmentId/$threadId'
     | '/draft/$draftId'
+    | '/viewer/$environmentId/$threadId'
+    | '/viewer/draft/$draftId'
   id:
     | '__root__'
     | '/_chat'
@@ -129,12 +152,16 @@ export interface FileRouteTypes {
     | '/_chat/'
     | '/_chat/$environmentId/$threadId'
     | '/_chat/draft/$draftId'
+    | '/viewer/$environmentId/$threadId'
+    | '/viewer/draft/$draftId'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   ChatRoute: typeof ChatRouteWithChildren
   PairRoute: typeof PairRoute
   SettingsRoute: typeof SettingsRouteWithChildren
+  ViewerEnvironmentIdThreadIdRoute: typeof ViewerEnvironmentIdThreadIdRoute
+  ViewerDraftDraftIdRoute: typeof ViewerDraftDraftIdRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -188,6 +215,20 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof SettingsArchivedRouteImport
       parentRoute: typeof SettingsRoute
     }
+    '/viewer/draft/$draftId': {
+      id: '/viewer/draft/$draftId'
+      path: '/viewer/draft/$draftId'
+      fullPath: '/viewer/draft/$draftId'
+      preLoaderRoute: typeof ViewerDraftDraftIdRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/viewer/$environmentId/$threadId': {
+      id: '/viewer/$environmentId/$threadId'
+      path: '/viewer/$environmentId/$threadId'
+      fullPath: '/viewer/$environmentId/$threadId'
+      preLoaderRoute: typeof ViewerEnvironmentIdThreadIdRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/_chat/draft/$draftId': {
       id: '/_chat/draft/$draftId'
       path: '/draft/$draftId'
@@ -239,6 +280,8 @@ const rootRouteChildren: RootRouteChildren = {
   ChatRoute: ChatRouteWithChildren,
   PairRoute: PairRoute,
   SettingsRoute: SettingsRouteWithChildren,
+  ViewerEnvironmentIdThreadIdRoute: ViewerEnvironmentIdThreadIdRoute,
+  ViewerDraftDraftIdRoute: ViewerDraftDraftIdRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

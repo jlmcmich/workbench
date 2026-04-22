@@ -524,11 +524,10 @@ describe("wsApi", () => {
     const { createLocalApi } = await import("./localApi");
     const api = createLocalApi(rpcClientMock as never);
 
-    await expect(api.shell.openAppWindow("http://127.0.0.1:3773/_viewer/environment/thread")).resolves
-      .toBeUndefined();
-    expect(openAppWindow).toHaveBeenCalledWith(
-      "http://127.0.0.1:3773/_viewer/environment/thread",
-    );
+    await expect(
+      api.shell.openAppWindow("http://127.0.0.1:3773/_viewer/environment/thread"),
+    ).resolves.toBeUndefined();
+    expect(openAppWindow).toHaveBeenCalledWith("http://127.0.0.1:3773/_viewer/environment/thread");
   });
 
   it("falls back to the browser context menu helper when the desktop bridge is missing", async () => {
@@ -553,8 +552,9 @@ describe("wsApi", () => {
     const { createLocalApi } = await import("./localApi");
     const api = createLocalApi(rpcClientMock as never);
 
-    await expect(api.shell.openAppWindow("http://localhost:3000/_viewer/environment/thread")).resolves
-      .toBeUndefined();
+    await expect(
+      api.shell.openAppWindow("http://localhost:3000/_viewer/environment/thread"),
+    ).resolves.toBeUndefined();
     expect(openWindow).toHaveBeenCalledWith(
       "http://localhost:3000/_viewer/environment/thread",
       "_blank",

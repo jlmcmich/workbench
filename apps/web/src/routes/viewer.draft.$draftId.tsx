@@ -83,7 +83,7 @@ function DraftViewerRouteView() {
   );
 }
 
-export const Route = createFileRoute("/_viewer/draft/$draftId")({
+export const Route = createFileRoute("/viewer/draft/$draftId")({
   validateSearch: (search) => parseViewerWindowRouteSearch(search),
   component: DraftViewerRouteView,
 });
