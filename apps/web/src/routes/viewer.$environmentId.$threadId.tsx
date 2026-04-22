@@ -1,7 +1,7 @@
 import { EnvironmentId, ThreadId } from "@workbench/contracts";
 import { createFileRoute } from "@tanstack/react-router";
 
-import ChatView from "../components/ChatView";
+import { WorkspaceViewerPage } from "../components/console/WorkspaceViewerPage";
 import { parseViewerWindowRouteSearch } from "../viewerWindowRoute";
 
 function ThreadViewerRouteView() {
@@ -11,15 +11,14 @@ function ThreadViewerRouteView() {
       threadId: ThreadId.make(params.threadId),
     }),
   });
-  const search = Route.useSearch();
+  const { path, mode } = Route.useSearch();
 
   return (
-    <ChatView
+    <WorkspaceViewerPage
       environmentId={environmentId}
       threadId={threadId}
-      routeKind="server"
-      reserveTitleBarControlInset={false}
-      viewerWindow={search}
+      initialPath={path}
+      initialMode={mode}
     />
   );
 }

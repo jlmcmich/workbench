@@ -157,8 +157,6 @@ interface ConsoleRailProps {
   inferredCheckpointTurnCountByTurnId: Readonly<Record<string, number>>;
   focusedPath?: string | null;
   expanded?: boolean;
-  viewerOnly?: boolean;
-  initialDocumentViewMode?: ViewerDocumentMode;
   onPopOutViewer?:
     | ((input: { path: string; mode: ViewerDocumentMode; hasUnsavedEdits: boolean }) => void)
     | undefined;
@@ -185,8 +183,6 @@ const ConsoleRail = memo(function ConsoleRail({
   inferredCheckpointTurnCountByTurnId,
   focusedPath,
   expanded = false,
-  viewerOnly = false,
-  initialDocumentViewMode = "preview",
   onPopOutViewer,
   onToggleExpanded,
   onViewerOverlayOpenChange,
@@ -200,8 +196,7 @@ const ConsoleRail = memo(function ConsoleRail({
 
   // ----- shared cross-pane state -----
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
-  const [documentViewMode, setDocumentViewMode] =
-    useState<ViewerDocumentMode>(initialDocumentViewMode);
+  const [documentViewMode, setDocumentViewMode] = useState<ViewerDocumentMode>("preview");
   const [expandedDirectories, setExpandedDirectories] = useState<Set<string>>(new Set());
   const [isSavingPlanToWorkspace, setIsSavingPlanToWorkspace] = useState(false);
   const [selectedDocumentText, setSelectedDocumentText] = useState("");
@@ -257,15 +252,8 @@ const ConsoleRail = memo(function ConsoleRail({
   // Pick a sensible default selection when the panel opens or the project
   // changes. We only *clear* an existing selection if we have positive
   // evidence the path is gone — otherwise an externally-set focusedPath can
-  // get clobbered before the entries query loads. In viewerOnly mode the
-  // URL-supplied focusedPath is authoritative, so the fallback never runs;
-  // otherwise a workspace with any artifacts but no entries yet would fail
-  // the stillExists check (artifacts only covers agent-touched files) and
-  // clobber the focused selection with an alphabetically-first file.
+  // get clobbered before the entries query loads.
   useEffect(() => {
-    if (viewerOnly) {
-      return;
-    }
     if (selectedPath) {
       const haveEntriesData = !!workspaceEntriesQuery.data;
       const haveArtifacts = artifacts.length > 0;
@@ -285,7 +273,7 @@ const ConsoleRail = memo(function ConsoleRail({
         firstFilePath(workspaceEntriesQuery.data?.entries) ??
         null,
     );
-  }, [artifacts, recentArtifacts, selectedPath, viewerOnly, workspaceEntriesQuery.data]);
+  }, [artifacts, recentArtifacts, selectedPath, workspaceEntriesQuery.data]);
 
   // Honor an external "focus this file" request from chat links — open the
   // viewer takeover so the file is immediately readable.
@@ -294,9 +282,9 @@ const ConsoleRail = memo(function ConsoleRail({
       return;
     }
     setSelectedPath(focusedPath);
-    setDocumentViewMode(initialDocumentViewMode);
+    setDocumentViewMode("preview");
     setViewerOverlayOpen(true);
-  }, [focusedPath, initialDocumentViewMode]);
+  }, [focusedPath]);
 
   // Auto-expand all ancestors of the selection so the tree can scroll to it.
   useEffect(() => {
@@ -398,10 +386,7 @@ const ConsoleRail = memo(function ConsoleRail({
       relativePath: selectedPath
         ? resolveWorkspaceSelectionPath(selectedPath, workspaceRoot)
         : null,
-      enabled:
-        (viewerOverlayOpen || viewerOnly) &&
-        !!workspaceRoot &&
-        selectedDescriptor?.previewKind === "text",
+      enabled: viewerOverlayOpen && !!workspaceRoot && selectedDescriptor?.previewKind === "text",
       maxBytes: 24_000,
     }),
   );
@@ -609,17 +594,13 @@ const ConsoleRail = memo(function ConsoleRail({
   }, []);
 
   const closeViewerOverlay = useCallback(() => {
-    if (viewerOnly) {
-      onClose();
-      return;
-    }
     setViewerOverlayOpen(false);
     // Widen is a viewer-scoped affordance — when the user closes the viewer
     // we return the rail to its normal width in one move.
     if (expanded && onToggleExpanded) {
       onToggleExpanded();
     }
-  }, [expanded, onClose, onToggleExpanded, viewerOnly]);
+  }, [expanded, onToggleExpanded]);
 
   const popOutViewer = useCallback(() => {
     if (!selectedPath || !onPopOutViewer) {
@@ -662,7 +643,7 @@ const ConsoleRail = memo(function ConsoleRail({
       ? `${artifacts.length} changed files`
       : "Browse the project and review outputs";
 
-  const showViewerOverlay = (viewerOnly || viewerOverlayOpen) && !!selectedPath;
+  const showViewerOverlay = viewerOverlayOpen && !!selectedPath;
 
   useEffect(() => {
     onViewerOverlayOpenChange?.(showViewerOverlay);
@@ -673,148 +654,117 @@ const ConsoleRail = memo(function ConsoleRail({
       data-panel-mode={mode}
       className="relative flex h-full min-h-0 min-w-0 w-full flex-col overflow-hidden bg-card/55 [-webkit-app-region:no-drag]"
     >
-      {viewerOnly ? (
-        <ViewerPane
-          workspaceRoot={workspaceRoot}
-          markdownCwd={markdownCwd}
-          resolvedTheme={resolvedTheme}
-          timestampFormat={timestampFormat}
-          selectedPath={selectedPath}
-          selectedArtifact={selectedArtifact}
-          documentViewMode={documentViewMode}
-          documentText={textFileQuery.data?.contents ?? null}
-          documentTextTruncated={textFileQuery.data?.truncated ?? false}
-          documentTextLoading={textFileQuery.isLoading}
-          patchPreview={textFileQuery.isError ? selectedPatchPreview : null}
-          selectedDocumentTextSelection={selectedDocumentText}
-          onSetDocumentViewMode={setDocumentViewMode}
-          onRefresh={refreshWorkspace}
-          onOpenInApp={openArtifactInNativeApp}
-          onOpenInEditor={openArtifactInEditor}
-          onPopOut={undefined}
-          onSyncSelection={syncSelectedDocumentText}
-          onClearSelection={() => setSelectedDocumentText("")}
-          onOpenWorkspaceFileLink={openWorkspaceFileFromLink}
-          onOpenTurnDiff={onOpenTurnDiff}
-          onSaveFile={saveWorkspaceFile}
-          onClosePane={closeViewerOverlay}
-        />
-      ) : (
-        <>
-          <RailHeader
-            summary={headerSummary}
-            panes={panes}
-            visibility={paneVisibility}
-            onTogglePane={togglePane}
-          />
+      <RailHeader
+        summary={headerSummary}
+        panes={panes}
+        visibility={paneVisibility}
+        onTogglePane={togglePane}
+      />
 
-          {/* Stack body — vertical scroll of cards. Always rendered so its state
+      {/* Stack body — vertical scroll of cards. Always rendered so its state
           (scroll position, query data, etc.) survives viewer takeover. */}
-          <ScrollArea className="min-h-0 flex-1">
-            <div className="flex flex-col gap-3 p-3">
-              {visibleIds.length === 0 ? (
-                <EmptyRailState onShowFiles={() => togglePane("tree")} />
-              ) : (
-                visibleIds.map((id) => {
-                  const descriptor = panes.find((p) => p.id === id)!;
-                  const cardTitle =
-                    id === "tree" ? basenameOfPath(workspaceRoot) : descriptor.label;
-                  return (
-                    <PaneCard
-                      key={id}
-                      id={id}
-                      title={cardTitle}
-                      Icon={descriptor.Icon}
-                      collapsed={paneCollapsed[id]}
-                      onToggleCollapsed={() => togglePaneCollapsed(id)}
-                      onClose={() => togglePane(id)}
-                      headerActions={
-                        id === "tree" ? (
-                          <TreePaneRevealAction
-                            workspaceRoot={workspaceRoot}
-                            onRevealWorkspaceRoot={revealWorkspaceRoot}
-                          />
-                        ) : null
-                      }
-                    >
-                      {id === "tree" ? (
-                        <TreePane
-                          resolvedTheme={resolvedTheme}
-                          treeNodes={workspaceTree}
-                          treeIsLoading={workspaceEntriesQuery.isLoading}
-                          selectedPath={selectedPath}
-                          expandedDirectories={expandedDirectories}
-                          selectedArtifact={selectedArtifact}
-                          firstDiffCapableArtifact={firstDiffCapableArtifact}
-                          onSelectFile={selectWorkspaceFile}
-                          onToggleDirectory={handleToggleDirectory}
-                          onOpenTurnDiff={onOpenTurnDiff}
-                        />
-                      ) : id === "recent" ? (
-                        <RecentChangesPane
-                          workspaceRoot={workspaceRoot}
-                          resolvedTheme={resolvedTheme}
-                          recentArtifacts={recentArtifacts}
-                          onSelectFile={selectWorkspaceFile}
-                        />
-                      ) : (
-                        <TaskPane
-                          workspaceRoot={workspaceRoot}
-                          markdownCwd={markdownCwd}
-                          timestampFormat={timestampFormat}
-                          activePlan={activePlan}
-                          activeProposedPlan={activeProposedPlan}
-                          isSavingPlanToWorkspace={isSavingPlanToWorkspace}
-                          isPlanCopied={isCopied}
-                          onCopyPlan={(markdown) => copyToClipboard(markdown)}
-                          onSavePlanToWorkspace={savePlanToWorkspace}
-                          onOpenWorkspaceFileLink={openWorkspaceFileFromLink}
-                        />
-                      )}
-                    </PaneCard>
-                  );
-                })
-              )}
-            </div>
-          </ScrollArea>
+      <ScrollArea className="min-h-0 flex-1">
+        <div className="flex flex-col gap-3 p-3">
+          {visibleIds.length === 0 ? (
+            <EmptyRailState onShowFiles={() => togglePane("tree")} />
+          ) : (
+            visibleIds.map((id) => {
+              const descriptor = panes.find((p) => p.id === id)!;
+              const cardTitle = id === "tree" ? basenameOfPath(workspaceRoot) : descriptor.label;
+              return (
+                <PaneCard
+                  key={id}
+                  id={id}
+                  title={cardTitle}
+                  Icon={descriptor.Icon}
+                  collapsed={paneCollapsed[id]}
+                  onToggleCollapsed={() => togglePaneCollapsed(id)}
+                  onClose={() => togglePane(id)}
+                  headerActions={
+                    id === "tree" ? (
+                      <TreePaneRevealAction
+                        workspaceRoot={workspaceRoot}
+                        onRevealWorkspaceRoot={revealWorkspaceRoot}
+                      />
+                    ) : null
+                  }
+                >
+                  {id === "tree" ? (
+                    <TreePane
+                      resolvedTheme={resolvedTheme}
+                      treeNodes={workspaceTree}
+                      treeIsLoading={workspaceEntriesQuery.isLoading}
+                      selectedPath={selectedPath}
+                      expandedDirectories={expandedDirectories}
+                      selectedArtifact={selectedArtifact}
+                      firstDiffCapableArtifact={firstDiffCapableArtifact}
+                      onSelectFile={selectWorkspaceFile}
+                      onToggleDirectory={handleToggleDirectory}
+                      onOpenTurnDiff={onOpenTurnDiff}
+                    />
+                  ) : id === "recent" ? (
+                    <RecentChangesPane
+                      workspaceRoot={workspaceRoot}
+                      resolvedTheme={resolvedTheme}
+                      recentArtifacts={recentArtifacts}
+                      onSelectFile={selectWorkspaceFile}
+                    />
+                  ) : (
+                    <TaskPane
+                      workspaceRoot={workspaceRoot}
+                      markdownCwd={markdownCwd}
+                      timestampFormat={timestampFormat}
+                      activePlan={activePlan}
+                      activeProposedPlan={activeProposedPlan}
+                      isSavingPlanToWorkspace={isSavingPlanToWorkspace}
+                      isPlanCopied={isCopied}
+                      onCopyPlan={(markdown) => copyToClipboard(markdown)}
+                      onSavePlanToWorkspace={savePlanToWorkspace}
+                      onOpenWorkspaceFileLink={openWorkspaceFileFromLink}
+                    />
+                  )}
+                </PaneCard>
+              );
+            })
+          )}
+        </div>
+      </ScrollArea>
 
-          {/* Viewer takeover — full-bleed overlay covering the entire rail
+      {/* Viewer takeover — full-bleed overlay covering the entire rail
           (including the header, so the rail's panel-collapse button isn't
           stacked on top of the viewer's own X). */}
-          {showViewerOverlay ? (
-            <div data-viewer-overlay className="absolute inset-0 z-20 flex flex-col bg-card">
-              <ViewerPane
-                workspaceRoot={workspaceRoot}
-                markdownCwd={markdownCwd}
-                resolvedTheme={resolvedTheme}
-                timestampFormat={timestampFormat}
-                selectedPath={selectedPath}
-                selectedArtifact={selectedArtifact}
-                documentViewMode={documentViewMode}
-                documentText={textFileQuery.data?.contents ?? null}
-                documentTextTruncated={textFileQuery.data?.truncated ?? false}
-                documentTextLoading={textFileQuery.isLoading}
-                patchPreview={textFileQuery.isError ? selectedPatchPreview : null}
-                selectedDocumentTextSelection={selectedDocumentText}
-                onSetDocumentViewMode={setDocumentViewMode}
-                onRefresh={refreshWorkspace}
-                onOpenInApp={openArtifactInNativeApp}
-                onOpenInEditor={openArtifactInEditor}
-                onPopOut={onPopOutViewer ? popOutViewer : undefined}
-                onSyncSelection={syncSelectedDocumentText}
-                onClearSelection={() => setSelectedDocumentText("")}
-                onAddSelectionToChat={onAddTextToChat ? addSelectedTextToChat : undefined}
-                onOpenWorkspaceFileLink={openWorkspaceFileFromLink}
-                onOpenTurnDiff={onOpenTurnDiff}
-                expanded={expanded}
-                onToggleExpanded={mode === "sidebar" ? onToggleExpanded : undefined}
-                onSaveFile={saveWorkspaceFile}
-                onClosePane={closeViewerOverlay}
-              />
-            </div>
-          ) : null}
-        </>
-      )}
+      {showViewerOverlay ? (
+        <div data-viewer-overlay className="absolute inset-0 z-20 flex flex-col bg-card">
+          <ViewerPane
+            workspaceRoot={workspaceRoot}
+            markdownCwd={markdownCwd}
+            resolvedTheme={resolvedTheme}
+            timestampFormat={timestampFormat}
+            selectedPath={selectedPath}
+            selectedArtifact={selectedArtifact}
+            documentViewMode={documentViewMode}
+            documentText={textFileQuery.data?.contents ?? null}
+            documentTextTruncated={textFileQuery.data?.truncated ?? false}
+            documentTextLoading={textFileQuery.isLoading}
+            patchPreview={textFileQuery.isError ? selectedPatchPreview : null}
+            selectedDocumentTextSelection={selectedDocumentText}
+            onSetDocumentViewMode={setDocumentViewMode}
+            onRefresh={refreshWorkspace}
+            onOpenInApp={openArtifactInNativeApp}
+            onOpenInEditor={openArtifactInEditor}
+            onPopOut={onPopOutViewer ? popOutViewer : undefined}
+            onSyncSelection={syncSelectedDocumentText}
+            onClearSelection={() => setSelectedDocumentText("")}
+            onAddSelectionToChat={onAddTextToChat ? addSelectedTextToChat : undefined}
+            onOpenWorkspaceFileLink={openWorkspaceFileFromLink}
+            onOpenTurnDiff={onOpenTurnDiff}
+            expanded={expanded}
+            onToggleExpanded={mode === "sidebar" ? onToggleExpanded : undefined}
+            onSaveFile={saveWorkspaceFile}
+            onClosePane={closeViewerOverlay}
+          />
+        </div>
+      ) : null}
     </div>
   );
 });

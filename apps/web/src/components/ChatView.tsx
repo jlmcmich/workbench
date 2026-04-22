@@ -112,7 +112,7 @@ import {
   useSavedEnvironmentRuntimeStore,
 } from "../environments/runtime";
 import { buildDraftThreadRouteParams, buildThreadRouteParams } from "../threadRoutes";
-import { buildViewerWindowUrl, type ViewerWindowRouteSearch } from "../viewerWindowRoute";
+import { buildViewerWindowUrl } from "../viewerWindowRoute";
 import {
   type ComposerImageAttachment,
   type DraftThreadEnvMode,
@@ -327,7 +327,6 @@ type ChatViewProps =
       onDiffPanelOpen?: () => void;
       reserveTitleBarControlInset?: boolean;
       routeKind: "server";
-      viewerWindow?: ViewerWindowRouteSearch;
       draftId?: never;
     }
   | {
@@ -336,7 +335,6 @@ type ChatViewProps =
       onDiffPanelOpen?: () => void;
       reserveTitleBarControlInset?: boolean;
       routeKind: "draft";
-      viewerWindow?: ViewerWindowRouteSearch;
       draftId: DraftId;
     };
 
@@ -600,7 +598,6 @@ export default function ChatView(props: ChatViewProps) {
     reserveTitleBarControlInset = true,
   } = props;
   const draftId = routeKind === "draft" ? props.draftId : null;
-  const viewerWindow = props.viewerWindow;
   const routeThreadRef = useMemo(
     () => scopeThreadRef(environmentId, threadId),
     [environmentId, threadId],
@@ -1906,28 +1903,6 @@ export default function ChatView(props: ChatViewProps) {
     },
     [activeWorkspaceRoot],
   );
-
-  const closeViewerWindow = useCallback(() => {
-    if (typeof window !== "undefined" && window.opener) {
-      window.close();
-      return;
-    }
-
-    if (routeKind === "draft" && draftId) {
-      void navigate({
-        to: "/draft/$draftId",
-        params: buildDraftThreadRouteParams(draftId),
-        replace: true,
-      });
-      return;
-    }
-
-    void navigate({
-      to: "/$environmentId/$threadId",
-      params: buildThreadRouteParams({ environmentId, threadId }),
-      replace: true,
-    });
-  }, [draftId, environmentId, navigate, routeKind, threadId]);
 
   const openDocumentViewerWindow = useCallback(
     (input: { path: string; mode: ViewerDocumentMode }) => {
@@ -3344,33 +3319,6 @@ export default function ChatView(props: ChatViewProps) {
   // Empty state: no active thread
   if (!activeThread) {
     return <NoActiveThreadState />;
-  }
-
-  if (viewerWindow) {
-    return (
-      <div className="flex h-dvh min-h-0 flex-col bg-background text-foreground">
-        <ConsoleRail
-          open
-          activePlan={activePlan}
-          activeProposedPlan={sidebarProposedPlan}
-          environmentId={environmentId}
-          markdownCwd={gitCwd ?? undefined}
-          workspaceRoot={activeWorkspaceRoot}
-          resolvedTheme={resolvedTheme}
-          timestampFormat={timestampFormat}
-          artifacts={workspaceArtifacts}
-          turnDiffSummaries={turnDiffSummaries}
-          inferredCheckpointTurnCountByTurnId={inferredCheckpointTurnCountByTurnId}
-          focusedPath={viewerWindow.path}
-          threadId={activeThread.id}
-          viewerOnly
-          initialDocumentViewMode={viewerWindow.mode}
-          mode="sheet"
-          onClose={closeViewerWindow}
-          onOpenTurnDiff={onOpenTurnDiff}
-        />
-      </div>
-    );
   }
 
   return (

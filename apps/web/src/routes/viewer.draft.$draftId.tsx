@@ -1,8 +1,8 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useEffect, useMemo } from "react";
 
-import ChatView from "../components/ChatView";
 import { threadHasStarted } from "../components/ChatView.logic";
+import { WorkspaceViewerPage } from "../components/console/WorkspaceViewerPage";
 import { DraftId, useComposerDraftStore } from "../composerDraftStore";
 import { createThreadSelectorAcrossEnvironments } from "../storeSelectors";
 import { useStore } from "../store";
@@ -12,7 +12,7 @@ import { parseViewerWindowRouteSearch } from "../viewerWindowRoute";
 function DraftViewerRouteView() {
   const navigate = useNavigate();
   const { draftId: rawDraftId } = Route.useParams();
-  const search = Route.useSearch();
+  const { path, mode } = Route.useSearch();
   const draftId = DraftId.make(rawDraftId);
   const draftSession = useComposerDraftStore((store) => store.getDraftSession(draftId));
   const serverThread = useStore(
@@ -57,12 +57,11 @@ function DraftViewerRouteView() {
 
   if (canonicalThreadRef) {
     return (
-      <ChatView
+      <WorkspaceViewerPage
         environmentId={canonicalThreadRef.environmentId}
         threadId={canonicalThreadRef.threadId}
-        routeKind="server"
-        reserveTitleBarControlInset={false}
-        viewerWindow={search}
+        initialPath={path}
+        initialMode={mode}
       />
     );
   }
@@ -72,13 +71,11 @@ function DraftViewerRouteView() {
   }
 
   return (
-    <ChatView
-      draftId={draftId}
+    <WorkspaceViewerPage
       environmentId={draftSession.environmentId}
       threadId={draftSession.threadId}
-      routeKind="draft"
-      reserveTitleBarControlInset={false}
-      viewerWindow={search}
+      initialPath={path}
+      initialMode={mode}
     />
   );
 }
