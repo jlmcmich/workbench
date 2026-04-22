@@ -179,6 +179,7 @@ import {
   type SidebarProjectGroupMember,
   type SidebarProjectSnapshot,
 } from "../sidebarProjectGrouping";
+import { cn } from "../lib/utils";
 const THREAD_PREVIEW_LIMIT = 6;
 const SIDEBAR_SORT_LABELS: Record<SidebarProjectSortOrder, string> = {
   updated_at: "Last activity",
@@ -199,6 +200,18 @@ const PROJECT_GROUPING_MODE_LABELS: Record<SidebarProjectGroupingMode, string> =
   repository_path: "Group by repository path",
   separate: "Keep separate",
 };
+
+type SidebarBrandingMode = "icon" | "compact" | "full";
+
+function resolveSidebarBrandingMode(width: number): SidebarBrandingMode {
+  if (width < 168) {
+    return "icon";
+  }
+  if (width < 250) {
+    return "compact";
+  }
+  return "full";
+}
 
 function threadJumpLabelMapsEqual(
   left: ReadonlyMap<string, string>,
@@ -2340,24 +2353,73 @@ const SidebarChromeHeader = memo(function SidebarChromeHeader({
 }: {
   isElectron: boolean;
 }) {
+  const brandingRef = useRef<HTMLDivElement | null>(null);
+  const [brandingMode, setBrandingMode] = useState<SidebarBrandingMode>("full");
+
+  useEffect(() => {
+    const node = brandingRef.current;
+    if (!node) {
+      return;
+    }
+
+    const updateBrandingMode = (width: number) => {
+      setBrandingMode((current) => {
+        const next = resolveSidebarBrandingMode(width);
+        return current === next ? current : next;
+      });
+    };
+
+    updateBrandingMode(node.getBoundingClientRect().width);
+    if (typeof ResizeObserver === "undefined") {
+      return;
+    }
+
+    const resizeObserver = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      updateBrandingMode(entry?.contentRect.width ?? node.getBoundingClientRect().width);
+    });
+    resizeObserver.observe(node);
+
+    return () => {
+      resizeObserver.disconnect();
+    };
+  }, []);
+
+  const showBrandName = brandingMode !== "icon";
+  const showStageLabel = brandingMode === "full";
   const wordmark = (
-    <div className="flex min-w-0 items-center gap-1.5 overflow-hidden">
+    <div ref={brandingRef} className="flex min-w-0 items-center gap-1.5 overflow-hidden">
       <SidebarTrigger className="shrink-0 text-muted-foreground/70 hover:text-foreground" />
       <Tooltip>
         <TooltipTrigger
           render={
             <Link
               aria-label="Go to tasks"
-              className="ml-0.5 flex min-w-0 max-w-full flex-1 cursor-pointer items-center gap-2 overflow-hidden rounded-2xl border border-border/60 bg-card/72 px-2.5 py-2 outline-hidden ring-ring shadow-[0_18px_40px_-34px_rgba(0,0,0,0.75)] transition-colors hover:text-foreground focus-visible:ring-2"
+              className={cn(
+                "ml-0.5 flex min-w-0 max-w-full cursor-pointer items-center overflow-hidden rounded-2xl border border-border/60 bg-card/72 outline-hidden ring-ring shadow-[0_18px_40px_-34px_rgba(0,0,0,0.75)] transition-colors hover:text-foreground focus-visible:ring-2",
+                brandingMode === "icon"
+                  ? "flex-none justify-center px-2 py-2"
+                  : "flex-1 gap-2 px-2.5 py-2",
+              )}
               to="/"
             >
-              <WorkbenchLogo aria-label="Workbench" className="size-6 shrink-0 text-foreground" />
-              <span className="truncate text-base font-semibold tracking-tight text-foreground/95">
-                {APP_BASE_NAME}
-              </span>
-              <span className="text-[10px] uppercase tracking-[0.18em] text-muted-foreground/45">
-                {APP_STAGE_LABEL}
-              </span>
+              <WorkbenchLogo
+                aria-label="Workbench"
+                className={cn(
+                  "shrink-0 text-foreground",
+                  brandingMode === "icon" ? "size-5" : "size-6",
+                )}
+              />
+              {showBrandName ? (
+                <span className="truncate text-base font-semibold tracking-tight text-foreground/95">
+                  {APP_BASE_NAME}
+                </span>
+              ) : null}
+              {showStageLabel ? (
+                <span className="text-[10px] uppercase tracking-[0.18em] text-muted-foreground/45">
+                  {APP_STAGE_LABEL}
+                </span>
+              ) : null}
             </Link>
           }
         />
@@ -2369,7 +2431,7 @@ const SidebarChromeHeader = memo(function SidebarChromeHeader({
   );
 
   return isElectron ? (
-    <SidebarHeader className="drag-region h-[52px] min-w-0 flex-row items-center gap-2 border-b border-border/50 px-4 py-0 pl-[90px] wco:h-[env(titlebar-area-height)] wco:pl-[calc(env(titlebar-area-x)+1em)]">
+    <SidebarHeader className="drag-region h-[52px] min-w-0 flex-row items-center gap-1.5 border-b border-border/50 px-4 py-0 pl-[80px] wco:h-[env(titlebar-area-height)] wco:pl-[calc(env(titlebar-area-x)+1em)]">
       {wordmark}
     </SidebarHeader>
   ) : (
