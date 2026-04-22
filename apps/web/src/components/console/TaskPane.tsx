@@ -1,16 +1,9 @@
 import type { TimestampFormat } from "@workbench/contracts/settings";
-import {
-  CheckIcon,
-  ChevronDownIcon,
-  ChevronRightIcon,
-  Loader2Icon,
-  Rows3Icon,
-} from "lucide-react";
+import { CheckIcon, ChevronDownIcon, ChevronRightIcon, Loader2Icon, Rows3Icon } from "lucide-react";
 import { useState } from "react";
 
 import { cn } from "~/lib/utils";
 
-import { formatWorkspaceRelativePath } from "../../filePathDisplay";
 import {
   buildProposedPlanMarkdownFilename,
   downloadPlanAsTextFile,
@@ -18,68 +11,11 @@ import {
   proposedPlanTitle,
   stripDisplayedPlanMarkdown,
 } from "../../proposedPlan";
-import type { ActivePlanState, LatestProposedPlanState, WorkLogEntry } from "../../session-logic";
+import type { ActivePlanState, LatestProposedPlanState } from "../../session-logic";
 import { formatTimestamp } from "../../timestampFormat";
 import ChatMarkdown from "../ChatMarkdown";
 import { Button } from "../ui/button";
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../ui/menu";
-
-function compactWorkHeading(workEntry: WorkLogEntry): string {
-  if (workEntry.requestKind === "command") return "Approval needed";
-  if (workEntry.requestKind === "file-read") return "Workspace access";
-  if (workEntry.requestKind === "file-change") return "Edit approval";
-  if (workEntry.itemType === "file_change" || (workEntry.changedFiles?.length ?? 0) > 0) {
-    return "Updated files";
-  }
-  if (workEntry.itemType === "web_search") return "Collected sources";
-  if (workEntry.itemType === "image_view") return "Reviewed image";
-  if (workEntry.itemType === "command_execution" || workEntry.command) {
-    return "Worked in workspace";
-  }
-  return workEntry.toolTitle?.trim() || workEntry.label;
-}
-
-function compactWorkPreview(
-  workEntry: WorkLogEntry,
-  workspaceRoot: string | undefined,
-): string | null {
-  const firstChangedFile = workEntry.changedFiles?.[0];
-  if (firstChangedFile) {
-    const displayPath = formatWorkspaceRelativePath(firstChangedFile, workspaceRoot);
-    return workEntry.changedFiles!.length > 1
-      ? `${displayPath} +${workEntry.changedFiles!.length - 1}`
-      : displayPath;
-  }
-  if (workEntry.detail?.trim()) {
-    return workEntry.detail.trim();
-  }
-  if (workEntry.command?.trim()) {
-    return workEntry.command.trim();
-  }
-  return null;
-}
-
-/**
- * Filter out raw / generic tool-call entries that aren't meaningful to a
- * non-technical reader. We keep entries that represent something a person
- * would recognize as "the agent did X": file changes, commands, file reads,
- * approvals, web searches, image reviews. Anything that would otherwise show
- * up as a bare "Tool call" with opaque payload gets dropped.
- */
-function isMeaningfulWorkEntry(entry: WorkLogEntry): boolean {
-  if (entry.requestKind) return true;
-  if (entry.changedFiles?.length) return true;
-  if (entry.command?.trim()) return true;
-  if (
-    entry.itemType === "file_change" ||
-    entry.itemType === "command_execution" ||
-    entry.itemType === "web_search" ||
-    entry.itemType === "image_view"
-  ) {
-    return true;
-  }
-  return false;
-}
 
 interface TaskPaneProps {
   workspaceRoot: string | undefined;
@@ -87,7 +23,6 @@ interface TaskPaneProps {
   timestampFormat: TimestampFormat;
   activePlan: ActivePlanState | null;
   activeProposedPlan: LatestProposedPlanState | null;
-  workEntries: ReadonlyArray<WorkLogEntry>;
   isSavingPlanToWorkspace: boolean;
   isPlanCopied: boolean;
   onCopyPlan: (markdown: string) => void;
@@ -105,7 +40,6 @@ export function TaskPane({
   timestampFormat,
   activePlan,
   activeProposedPlan,
-  workEntries,
   isSavingPlanToWorkspace,
   isPlanCopied,
   onCopyPlan,
@@ -118,9 +52,7 @@ export function TaskPane({
   const displayedPlanMarkdown = planMarkdown ? stripDisplayedPlanMarkdown(planMarkdown) : null;
   const planTitle = planMarkdown ? proposedPlanTitle(planMarkdown) : null;
 
-  const meaningfulWorkEntries = workEntries.filter(isMeaningfulWorkEntry);
-  const hasContent =
-    !!activePlan || !!activeProposedPlan || meaningfulWorkEntries.length > 0;
+  const hasContent = !!activePlan || !!activeProposedPlan;
 
   return (
     <div className="min-h-0 flex-1">
@@ -144,10 +76,7 @@ export function TaskPane({
               const isCompleted = step.status === "completed";
               const isInProgress = step.status === "inProgress";
               return (
-                <li
-                  key={`${step.status}:${step.step}`}
-                  className="flex items-start gap-3"
-                >
+                <li key={`${step.status}:${step.step}`} className="flex items-start gap-3">
                   <PlanStepStatusIcon status={step.status} />
                   <p
                     className={cn(
@@ -228,41 +157,6 @@ export function TaskPane({
                 />
               </div>
             ) : null}
-          </div>
-        ) : null}
-
-        {meaningfulWorkEntries.length > 0 ? (
-          <div className="space-y-2">
-            <p className="px-1 text-[11px] font-semibold tracking-[0.16em] text-muted-foreground/55 uppercase">
-              Recent activity
-            </p>
-            {meaningfulWorkEntries
-              .slice(-6)
-              .toReversed()
-              .map((entry) => {
-                const preview = compactWorkPreview(entry, workspaceRoot);
-                return (
-                  <div
-                    key={entry.id}
-                    className="rounded-2xl border border-border/55 bg-background/55 px-4 py-3"
-                  >
-                    <div className="flex items-center gap-2">
-                      <Rows3Icon className="size-3.5 shrink-0 text-muted-foreground/55" />
-                      <p className="min-w-0 flex-1 truncate text-sm text-foreground/86">
-                        {compactWorkHeading(entry)}
-                      </p>
-                      <span className="text-[11px] text-muted-foreground/60">
-                        {formatTimestamp(entry.createdAt, timestampFormat)}
-                      </span>
-                    </div>
-                    {preview ? (
-                      <p className="mt-1 pl-5 text-xs leading-5 text-muted-foreground/72">
-                        {preview}
-                      </p>
-                    ) : null}
-                  </div>
-                );
-              })}
           </div>
         ) : null}
       </div>

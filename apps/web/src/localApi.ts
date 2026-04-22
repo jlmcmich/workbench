@@ -53,6 +53,25 @@ export function createLocalApi(rpcClient: WsRpcClient): LocalApi {
 
         window.open(url, "_blank", "noopener,noreferrer");
       },
+      openAppWindow: async (url) => {
+        if (window.desktopBridge) {
+          const opened = await window.desktopBridge.openAppWindow(url);
+          if (!opened) {
+            throw new Error("Unable to open window.");
+          }
+          return;
+        }
+
+        const openedWindow = window.open(
+          url,
+          "_blank",
+          "popup=yes,noopener,noreferrer,width=1120,height=820",
+        );
+        if (!openedWindow) {
+          throw new Error("Unable to open window.");
+        }
+        openedWindow.focus?.();
+      },
     },
     contextMenu: {
       show: async <T extends string>(

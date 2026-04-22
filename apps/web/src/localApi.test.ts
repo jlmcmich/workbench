@@ -184,6 +184,7 @@ function makeDesktopBridge(overrides: Partial<DesktopBridge> = {}): DesktopBridg
     setTheme: async () => undefined,
     showContextMenu: async () => null,
     openExternal: async () => true,
+    openAppWindow: async () => true,
     onMenuAction: () => () => undefined,
     getUpdateState: async () => {
       throw new Error("getUpdateState not implemented in test");
@@ -516,6 +517,19 @@ describe("wsApi", () => {
     expect(pickFolder).toHaveBeenCalledWith({ initialPath: "/tmp/workspace" });
   });
 
+  it("forwards internal app window opens to the desktop bridge", async () => {
+    const openAppWindow = vi.fn().mockResolvedValue(true);
+    getWindowForTest().desktopBridge = makeDesktopBridge({ openAppWindow });
+
+    const { createLocalApi } = await import("./localApi");
+    const api = createLocalApi(rpcClientMock as never);
+
+    await expect(
+      api.shell.openAppWindow("http://127.0.0.1:3773/_viewer/environment/thread"),
+    ).resolves.toBeUndefined();
+    expect(openAppWindow).toHaveBeenCalledWith("http://127.0.0.1:3773/_viewer/environment/thread");
+  });
+
   it("falls back to the browser context menu helper when the desktop bridge is missing", async () => {
     showContextMenuFallbackMock.mockResolvedValue("rename");
     const { createLocalApi } = await import("./localApi");
@@ -525,6 +539,27 @@ describe("wsApi", () => {
 
     await expect(api.contextMenu.show(items, { x: 4, y: 5 })).resolves.toBe("rename");
     expect(showContextMenuFallbackMock).toHaveBeenCalledWith(items, { x: 4, y: 5 });
+  });
+
+  it("falls back to window.open for internal app windows in the browser", async () => {
+    const openWindow = vi.fn(() => ({ focus: vi.fn() }));
+    Object.defineProperty(getWindowForTest(), "open", {
+      value: openWindow,
+      configurable: true,
+      writable: true,
+    });
+
+    const { createLocalApi } = await import("./localApi");
+    const api = createLocalApi(rpcClientMock as never);
+
+    await expect(
+      api.shell.openAppWindow("http://localhost:3000/_viewer/environment/thread"),
+    ).resolves.toBeUndefined();
+    expect(openWindow).toHaveBeenCalledWith(
+      "http://localhost:3000/_viewer/environment/thread",
+      "_blank",
+      "popup=yes,noopener,noreferrer,width=1120,height=820",
+    );
   });
 
   it("reads and writes persistence through the desktop bridge when available", async () => {

@@ -111,7 +111,8 @@ import {
   useSavedEnvironmentRegistryStore,
   useSavedEnvironmentRuntimeStore,
 } from "../environments/runtime";
-import { buildDraftThreadRouteParams } from "../threadRoutes";
+import { buildDraftThreadRouteParams, buildThreadRouteParams } from "../threadRoutes";
+import { buildViewerWindowPath, type ViewerWindowRouteSearch } from "../viewerWindowRoute";
 import {
   type ComposerImageAttachment,
   type DraftThreadEnvMode,
@@ -134,6 +135,7 @@ import { ChatHeader } from "./chat/ChatHeader";
 import { type ExpandedImagePreview } from "./chat/ExpandedImagePreview";
 import { NoActiveThreadState } from "./NoActiveThreadState";
 import ConsoleRail from "./console/ConsoleRail";
+import type { ViewerDocumentMode } from "./console/ViewerPane";
 import { resolveEffectiveEnvMode, resolveEnvironmentOptionLabel } from "./BranchToolbar.logic";
 import { ProviderStatusBanner } from "./chat/ProviderStatusBanner";
 import { ThreadErrorBanner } from "./chat/ThreadErrorBanner";
@@ -176,8 +178,10 @@ const EMPTY_ACTIVITIES: OrchestrationThreadActivity[] = [];
 const EMPTY_PROPOSED_PLANS: Thread["proposedPlans"] = [];
 const EMPTY_PROVIDERS: ServerProvider[] = [];
 const EMPTY_PENDING_USER_INPUT_ANSWERS: Record<string, PendingUserInputDraftAnswer> = {};
-const WORKSPACE_INLINE_DEFAULT_WIDTH = "clamp(24rem,38vw,48rem)";
-const WORKSPACE_INLINE_SIDEBAR_MIN_WIDTH = 22 * 16;
+const WORKSPACE_INLINE_DEFAULT_WIDTH = "clamp(18rem,22vw,26rem)";
+const WORKSPACE_INLINE_EXPANDED_WIDTH = "clamp(22rem,28vw,34rem)";
+const WORKSPACE_INLINE_SIDEBAR_MIN_WIDTH = 18 * 16;
+const WORKSPACE_INLINE_SIDEBAR_MAX_WIDTH = 32 * 16;
 
 type ThreadPlanCatalogEntry = Pick<Thread, "id" | "proposedPlans">;
 
@@ -317,6 +321,7 @@ type ChatViewProps =
       onDiffPanelOpen?: () => void;
       reserveTitleBarControlInset?: boolean;
       routeKind: "server";
+      viewerWindow?: ViewerWindowRouteSearch;
       draftId?: never;
     }
   | {
@@ -325,6 +330,7 @@ type ChatViewProps =
       onDiffPanelOpen?: () => void;
       reserveTitleBarControlInset?: boolean;
       routeKind: "draft";
+      viewerWindow?: ViewerWindowRouteSearch;
       draftId: DraftId;
     };
 
@@ -588,6 +594,7 @@ export default function ChatView(props: ChatViewProps) {
     reserveTitleBarControlInset = true,
   } = props;
   const draftId = routeKind === "draft" ? props.draftId : null;
+  const viewerWindow = props.viewerWindow;
   const routeThreadRef = useMemo(
     () => scopeThreadRef(environmentId, threadId),
     [environmentId, threadId],
@@ -681,12 +688,18 @@ export default function ChatView(props: ChatViewProps) {
   const { state: leftSidebarState } = useSidebar();
   const isLeftSidebarCollapsed = leftSidebarState === "collapsed";
   const [planSidebarOpen, setPlanSidebarOpen] = useState(false);
-  // When true, the console rail breaks out of the flex row and overlays the
-  // chat column entirely (only the left sidebar stays visible). User toggles
-  // this via the Expand button in the rail header.
+  // When true, the console rail widens to a roomier reading width. We keep
+  // the chat column visible instead of letting the Console take over the
+  // whole work surface.
   const [consoleRailExpanded, setConsoleRailExpanded] = useState(false);
+  const [consoleRailInlineWidth, setConsoleRailInlineWidth] = useState<number | null>(null);
   const toggleConsoleRailExpanded = useCallback(() => {
     setConsoleRailExpanded((prev) => !prev);
+  }, []);
+  const handleConsoleViewerOverlayOpenChange = useCallback((open: boolean) => {
+    if (!open) {
+      setConsoleRailExpanded(false);
+    }
   }, []);
   const shouldUsePlanSidebarSheet = useMediaQuery(RIGHT_PANEL_INLINE_LAYOUT_MEDIA_QUERY);
   // Tracks whether the user explicitly dismissed the sidebar for the active turn.
@@ -1059,6 +1072,10 @@ export default function ChatView(props: ChatViewProps) {
   );
   const selectedProvider: ProviderKind = lockedProvider ?? unlockedSelectedProvider;
   const phase = derivePhase(activeThread?.session ?? null);
+  // `canQueue` gates the composer's steer/follow-up menu. Pi is the only
+  // provider that accepts queued messages today; other providers return a
+  // request error if the command reaches them, so don't offer the UI.
+  const canQueue = threadProvider === "pi" && phase === "running";
   const threadActivities = activeThread?.activities ?? EMPTY_ACTIVITIES;
   const workLogEntries = useMemo(
     () => deriveWorkLogEntries(threadActivities, activeLatestTurn?.turnId ?? undefined),
@@ -1816,6 +1833,8 @@ export default function ChatView(props: ChatViewProps) {
   }, [currentWorkspacePanelKey]);
   const closePlanSidebar = useCallback(() => {
     setPlanSidebarOpen(false);
+    setConsoleRailExpanded(false);
+    setConsoleRailInlineWidth(null);
     planSidebarDismissedForTurnRef.current = currentWorkspacePanelKey;
   }, [currentWorkspacePanelKey]);
   const handleWorkspacePanelOpenChange = useCallback(
@@ -1843,14 +1862,31 @@ export default function ChatView(props: ChatViewProps) {
       if (typeof window === "undefined") {
         return true;
       }
-      // Cap manual drag at 50% of the viewport. Drag is for "I want a roomier
-      // stack"; the viewer's Expand button is the affordance for going wider
-      // than that (covers the chat column entirely so a file can be read or
-      // edited at full width).
-      return nextWidth <= window.innerWidth * 0.5;
+      // Keep the default workspace rail compact. Drag is for "I want a bit
+      // more room"; the viewer's Expand button is the affordance for going
+      // truly wide and covering the chat column entirely.
+      const viewportCap = window.innerWidth * 0.4;
+      const allowedMaxWidth = Math.min(WORKSPACE_INLINE_SIDEBAR_MAX_WIDTH, viewportCap);
+      // Cap manual drag at a compact max width. The viewer's Expand button is
+      // the affordance for going wider than that (covers the chat column entirely
+      // so a file can be read or edited at full width).
+      return nextWidth <= allowedMaxWidth;
     },
     [],
   );
+  const handleConsoleRailResize = useCallback(
+    (width: number) => {
+      if (!consoleRailExpanded) {
+        setConsoleRailInlineWidth(width);
+      }
+    },
+    [consoleRailExpanded],
+  );
+  const resolvedConsoleRailWidth =
+    consoleRailInlineWidth === null
+      ? WORKSPACE_INLINE_DEFAULT_WIDTH
+      : `${consoleRailInlineWidth}px`;
+
   const openWorkspaceFileInPanel = useCallback(
     (path: string) => {
       const selectionPath = resolveWorkspaceSelectionPath(path, activeWorkspaceRoot);
@@ -1863,6 +1899,86 @@ export default function ChatView(props: ChatViewProps) {
       return true;
     },
     [activeWorkspaceRoot],
+  );
+
+  const closeViewerWindow = useCallback(() => {
+    if (typeof window !== "undefined" && window.opener) {
+      window.close();
+      return;
+    }
+
+    if (routeKind === "draft" && draftId) {
+      void navigate({
+        to: "/draft/$draftId",
+        params: buildDraftThreadRouteParams(draftId),
+        replace: true,
+      });
+      return;
+    }
+
+    void navigate({
+      to: "/$environmentId/$threadId",
+      params: buildThreadRouteParams({ environmentId, threadId }),
+      replace: true,
+    });
+  }, [draftId, environmentId, navigate, routeKind, threadId]);
+
+  const openDocumentViewerWindow = useCallback(
+    (input: { path: string; mode: ViewerDocumentMode }) => {
+      const localApi = readLocalApi();
+      if (!localApi) {
+        toastManager.add({
+          type: "error",
+          title: "Could not open document window",
+          description: "The local app shell is unavailable.",
+        });
+        return;
+      }
+
+      const targetPath =
+        resolveWorkspaceSelectionPath(input.path, activeWorkspaceRoot) ?? input.path;
+      const targetUrl = new URL(
+        buildViewerWindowPath(
+          routeKind === "draft" && draftId
+            ? { routeKind: "draft", draftId }
+            : { routeKind: "server", environmentId, threadId },
+          { path: targetPath, mode: input.mode },
+        ),
+        window.location.origin,
+      ).toString();
+
+      void localApi.shell.openAppWindow(targetUrl).catch((error) => {
+        toastManager.add({
+          type: "error",
+          title: "Could not open document window",
+          description: error instanceof Error ? error.message : "An error occurred.",
+        });
+      });
+    },
+    [activeWorkspaceRoot, draftId, environmentId, routeKind, threadId],
+  );
+
+  const handlePopOutViewerRequest = useCallback(
+    (input: { path: string; mode: ViewerDocumentMode; hasUnsavedEdits: boolean }) => {
+      void (async () => {
+        if (input.hasUnsavedEdits) {
+          const localApi = readLocalApi();
+          const confirmed = localApi
+            ? await localApi.dialogs.confirm(
+                "Unsaved quick edits will not carry over to the new window. Open it anyway?",
+              )
+            : window.confirm(
+                "Unsaved quick edits will not carry over to the new window. Open it anyway?",
+              );
+          if (!confirmed) {
+            return;
+          }
+        }
+
+        openDocumentViewerWindow({ path: input.path, mode: input.mode });
+      })();
+    },
+    [openDocumentViewerWindow],
   );
 
   const persistThreadSettingsForNextTurn = useCallback(
@@ -2646,6 +2762,39 @@ export default function ChatView(props: ChatViewProps) {
     });
   };
 
+  // Queue a prompt against the in-flight turn (pi-only today). Mirrors
+  // onSend but dispatches `thread.turn.queue` with the selected kind and
+  // clears the composer text so the user sees it was sent. Attachments
+  // aren't included yet — adding them would require decisions about
+  // whether images apply to the in-flight turn or the queued follow-up.
+  const onQueueMessage = useCallback(
+    async (kind: "steer" | "followUp") => {
+      const api = readEnvironmentApi(environmentId);
+      if (!api || !activeThread) return;
+      const text = promptRef.current.trim();
+      if (text.length === 0) return;
+      await api.orchestration.dispatchCommand({
+        type: "thread.turn.queue",
+        commandId: newCommandId(),
+        threadId: activeThread.id,
+        kind,
+        text,
+        createdAt: new Date().toISOString(),
+      });
+      promptRef.current = "";
+      clearComposerDraftContent(composerDraftTarget);
+      composerRef.current?.resetCursorState();
+    },
+    [
+      environmentId,
+      activeThread,
+      promptRef,
+      clearComposerDraftContent,
+      composerDraftTarget,
+      composerRef,
+    ],
+  );
+
   const onRespondToApproval = useCallback(
     async (requestId: ApprovalRequestId, decision: ProviderApprovalDecision) => {
       const api = readEnvironmentApi(environmentId);
@@ -3191,6 +3340,33 @@ export default function ChatView(props: ChatViewProps) {
     return <NoActiveThreadState />;
   }
 
+  if (viewerWindow) {
+    return (
+      <div className="flex h-dvh min-h-0 flex-col bg-background text-foreground">
+        <ConsoleRail
+          open
+          activePlan={activePlan}
+          activeProposedPlan={sidebarProposedPlan}
+          environmentId={environmentId}
+          markdownCwd={gitCwd ?? undefined}
+          workspaceRoot={activeWorkspaceRoot}
+          resolvedTheme={resolvedTheme}
+          timestampFormat={timestampFormat}
+          artifacts={workspaceArtifacts}
+          turnDiffSummaries={turnDiffSummaries}
+          inferredCheckpointTurnCountByTurnId={inferredCheckpointTurnCountByTurnId}
+          focusedPath={viewerWindow.path}
+          threadId={activeThread.id}
+          viewerOnly
+          initialDocumentViewMode={viewerWindow.mode}
+          mode="sheet"
+          onClose={closeViewerWindow}
+          onOpenTurnDiff={onOpenTurnDiff}
+        />
+      </div>
+    );
+  }
+
   return (
     <div className="cowork-shell flex min-h-0 min-w-0 flex-1 flex-col overflow-x-hidden bg-background">
       {/* Top bar */}
@@ -3342,6 +3518,8 @@ export default function ChatView(props: ChatViewProps) {
               scheduleStickToBottom={scrollToEnd}
               onSend={onSend}
               onInterrupt={onInterrupt}
+              onQueue={onQueueMessage}
+              canQueue={canQueue}
               onImplementPlanInNewThread={onImplementPlanInNewThread}
               onRespondToApproval={onRespondToApproval}
               onSelectActivePendingUserInputOption={onSelectActivePendingUserInputOption}
@@ -3409,10 +3587,8 @@ export default function ChatView(props: ChatViewProps) {
 
         {/* Workspace rail.
             In normal mode it sits in the flex row to the right of the chat.
-            In expanded mode it absolutely overlays the row from edge to edge,
-            covering the chat column entirely (the left sidebar — outside this
-            row — stays visible). The user shrinks back via the Minimize
-            button in the rail header. */}
+            In expanded mode it grows to a wider reading width, but it stays
+            in the same row so the chat column remains visible. */}
         {!shouldUsePlanSidebarSheet ? (
           <SidebarProvider
             defaultOpen={false}
@@ -3421,7 +3597,9 @@ export default function ChatView(props: ChatViewProps) {
             className="w-auto min-h-0 flex-none bg-transparent"
             style={
               {
-                "--sidebar-width": consoleRailExpanded ? "100%" : WORKSPACE_INLINE_DEFAULT_WIDTH,
+                "--sidebar-width": consoleRailExpanded
+                  ? WORKSPACE_INLINE_EXPANDED_WIDTH
+                  : resolvedConsoleRailWidth,
               } as CSSProperties
             }
           >
@@ -3430,7 +3608,9 @@ export default function ChatView(props: ChatViewProps) {
               collapsible="offcanvas"
               className="border-l border-border bg-card text-foreground"
               resizable={{
+                maxWidth: WORKSPACE_INLINE_SIDEBAR_MAX_WIDTH,
                 minWidth: WORKSPACE_INLINE_SIDEBAR_MIN_WIDTH,
+                onResize: handleConsoleRailResize,
                 shouldAcceptWidth: shouldAcceptWorkspaceSidebarWidth,
               }}
             >
@@ -3445,14 +3625,15 @@ export default function ChatView(props: ChatViewProps) {
                   resolvedTheme={resolvedTheme}
                   timestampFormat={timestampFormat}
                   artifacts={workspaceArtifacts}
-                  workEntries={workLogEntries}
                   turnDiffSummaries={turnDiffSummaries}
                   inferredCheckpointTurnCountByTurnId={inferredCheckpointTurnCountByTurnId}
                   focusedPath={workspacePanelFocusedPath}
                   threadId={activeThread.id}
                   mode="sidebar"
                   expanded={consoleRailExpanded}
+                  onPopOutViewer={handlePopOutViewerRequest}
                   onToggleExpanded={toggleConsoleRailExpanded}
+                  onViewerOverlayOpenChange={handleConsoleViewerOverlayOpenChange}
                   onClose={closePlanSidebar}
                   onOpenTurnDiff={onOpenTurnDiff}
                   onAddTextToChat={addWorkspaceTextToComposer}
@@ -3495,12 +3676,13 @@ export default function ChatView(props: ChatViewProps) {
             resolvedTheme={resolvedTheme}
             timestampFormat={timestampFormat}
             artifacts={workspaceArtifacts}
-            workEntries={workLogEntries}
             turnDiffSummaries={turnDiffSummaries}
             inferredCheckpointTurnCountByTurnId={inferredCheckpointTurnCountByTurnId}
             focusedPath={workspacePanelFocusedPath}
             threadId={activeThread.id}
             mode="sheet"
+            onPopOutViewer={handlePopOutViewerRequest}
+            onViewerOverlayOpenChange={handleConsoleViewerOverlayOpenChange}
             onClose={closePlanSidebar}
             onOpenTurnDiff={onOpenTurnDiff}
             onAddTextToChat={addWorkspaceTextToComposer}
