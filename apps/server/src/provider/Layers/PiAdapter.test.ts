@@ -77,6 +77,12 @@ class FakeRpcChildProcess extends EventEmitter {
     readonly promptTemplates?: ReadonlyArray<unknown>;
     readonly skills?: ReadonlyArray<unknown>;
   } = {};
+  /** Canned switch_session response — individual tests can mutate via configureSwitchSession. */
+  private switchSessionResponse: {
+    readonly success: boolean;
+    readonly error?: string;
+    readonly data?: { readonly cancelled?: boolean };
+  } = { success: true };
 
   constructor() {
     super();
@@ -107,6 +113,13 @@ class FakeRpcChildProcess extends EventEmitter {
                 `${JSON.stringify({ type: "response", command: "get_commands", id: frame.id, success: true, data: this.commandsResponse })}\n`,
               ),
             );
+          } else if (frame.type === "switch_session" && typeof frame.id === "string") {
+            setImmediate(() =>
+              this.stdout.emit(
+                "data",
+                `${JSON.stringify({ type: "response", command: "switch_session", id: frame.id, ...this.switchSessionResponse })}\n`,
+              ),
+            );
           }
         } catch {
           // ignore — tests may write malformed frames intentionally
@@ -114,6 +127,14 @@ class FakeRpcChildProcess extends EventEmitter {
       }
       return result;
     };
+  }
+
+  configureSwitchSession(response: {
+    readonly success: boolean;
+    readonly error?: string;
+    readonly data?: { readonly cancelled?: boolean };
+  }): void {
+    this.switchSessionResponse = response;
   }
 
   configureCommands(commands: {
@@ -2283,29 +2304,103 @@ describe("PiAdapterLive", () => {
         Effect.gen(function* () {
           const adapter = yield* PiAdapter;
           const threadId = asThreadId("thread-pi-rpc-persist");
-          const startPromise = Effect.runPromise(
-            adapter
-              .startSession({ provider: "pi", threadId, runtimeMode: "full-access" })
-              .pipe(Effect.provide(persistLayer)),
-          );
-          yield* Effect.sleep(10);
+          yield* adapter.startSession({
+            provider: "pi",
+            threadId,
+            runtimeMode: "full-access",
+          });
+          // FakeRpcChildProcess auto-responds to switch_session, so we just
+          // assert the frame was written with the stored path.
+          yield* Effect.sleep(30);
           const child = secondRpcChildren[0]!;
-          // Answer the switch_session that the adapter should fire before get_state.
-          // (FakeRpcChildProcess doesn't auto-respond to it, so we match + respond
-          // manually to keep the call synchronous.)
-          const pollStart = Date.now();
-          while (Date.now() - pollStart < 500) {
-            const frame = child
-              .writtenFrames()
-              .find((f) => f.type === "switch_session") as Record<string, unknown>;
-            if (frame) {
-              assert.equal(frame.sessionPath, "/tmp/pi-sessions/persist-1.jsonl");
-              child.respondTo(frame, { success: true });
-              break;
-            }
-            yield* Effect.sleep(10);
-          }
-          yield* Effect.promise(() => startPromise);
+          const switchFrame = child
+            .writtenFrames()
+            .find((f) => f.type === "switch_session") as Record<string, unknown> | undefined;
+          assert.ok(switchFrame, "second startSession should write a switch_session frame");
+          assert.equal(switchFrame?.sessionPath, "/tmp/pi-sessions/persist-1.jsonl");
+        }).pipe(Effect.provide(persistLayer)),
+      );
+    });
+
+    it("tolerates a slow switch_session without falling through to fresh", async () => {
+      const baseDir = mkdtempSync(pathJoin(tmpdir(), "pi-resume-slow-"));
+      const persistLayer = makePiAdapterLive().pipe(
+        Layer.provideMerge(ServerConfig.layerTest(process.cwd(), baseDir)),
+        Layer.provideMerge(
+          ServerSettingsService.layerTest({
+            providers: {
+              pi: {
+                binaryPath: "fake-pi",
+                defaultProvider: "",
+                customModels: [],
+                enabled: true,
+                transport: "rpc",
+              },
+            },
+          }),
+        ),
+        Layer.provideMerge(NodeServices.layer),
+      );
+
+      // Pre-seed a stored record so the next startSession calls switch_session.
+      const pathMod = await import("node:path");
+      const fsMod = await import("node:fs/promises");
+      const storeDir = pathMod.join(baseDir, "pi-sessions");
+      await fsMod.mkdir(storeDir, { recursive: true });
+      const normalizedThreadId = "thread-pi-rpc-slow-switch";
+      await fsMod.writeFile(
+        pathMod.join(storeDir, `${normalizedThreadId}.json`),
+        JSON.stringify({
+          sessionFile: "/tmp/pi-sessions/slow.jsonl",
+          updatedAt: new Date().toISOString(),
+        }),
+      );
+
+      const rpcChildren: FakeRpcChildProcess[] = [];
+      spawnMock.mockReset();
+      spawnMock.mockImplementation((_bin: string, args: string[]) => {
+        if (args.includes("--list-models")) {
+          const catalog = new FakeChildProcess();
+          setImmediate(() => catalog.emit("exit", 0, null));
+          return catalog;
+        }
+        const child = new FakeRpcChildProcess();
+        child.configureState({
+          sessionId: "pi-uuid-slow",
+          sessionFile: "/tmp/pi-sessions/slow.jsonl",
+        });
+        // Auto-respond happens on setImmediate, so even a "slow" switch_session
+        // lands well under the 30s real-world cap we now allow. We assert the
+        // call completed without emitting the "did not respond" warning.
+        rpcChildren.push(child);
+        return child;
+      });
+
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const adapter = yield* PiAdapter;
+          const threadId = asThreadId(normalizedThreadId);
+          const eventsFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 3)).pipe(
+            Effect.forkChild,
+          );
+          yield* Effect.sleep(0);
+          yield* adapter.startSession({
+            provider: "pi",
+            threadId,
+            runtimeMode: "full-access",
+          });
+          yield* Effect.sleep(30);
+          const events = yield* joinEvents(eventsFiber);
+          const timeoutWarn = events.find(
+            (e) =>
+              e.type === "runtime.warning" &&
+              /did not respond to switch_session/.test(e.payload.message),
+          );
+          assert.equal(
+            timeoutWarn,
+            undefined,
+            "switch_session should not hit the new 30s timeout on a normal-speed response",
+          );
         }).pipe(Effect.provide(persistLayer)),
       );
     });

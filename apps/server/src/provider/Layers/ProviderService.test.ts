@@ -611,10 +611,17 @@ routing.layer("ProviderServiceLive routing", (it) => {
         input: "focus on error handling",
       });
       assert.equal(routing.codex.queueMessage.mock.calls.length, 1);
-      const queueCall = routing.codex.queueMessage.mock.calls[0];
-      assert.equal(queueCall?.[0], session.threadId);
-      assert.equal(queueCall?.[1], "steer");
-      assert.equal((queueCall?.[2] as { input?: string }).input, "focus on error handling");
+      // vi.fn inference on a 3-arg signature doesn't narrow the call tuple,
+      // so fall back to `any` here — the runtime assertions below cover the
+      // actual contract.
+      const queueCall = (routing.codex.queueMessage.mock.calls[0] ?? []) as unknown as readonly [
+        unknown,
+        unknown,
+        { readonly input?: string },
+      ];
+      assert.equal(queueCall[0], session.threadId);
+      assert.equal(queueCall[1], "steer");
+      assert.equal(queueCall[2]?.input, "focus on error handling");
 
       yield* provider.respondToRequest({
         threadId: session.threadId,
