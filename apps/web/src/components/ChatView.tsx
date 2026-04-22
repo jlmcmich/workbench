@@ -112,7 +112,7 @@ import {
   useSavedEnvironmentRuntimeStore,
 } from "../environments/runtime";
 import { buildDraftThreadRouteParams, buildThreadRouteParams } from "../threadRoutes";
-import { buildViewerWindowPath, type ViewerWindowRouteSearch } from "../viewerWindowRoute";
+import { buildViewerWindowUrl, type ViewerWindowRouteSearch } from "../viewerWindowRoute";
 import {
   type ComposerImageAttachment,
   type DraftThreadEnvMode,
@@ -170,7 +170,13 @@ import { RightPanelSheet } from "./RightPanelSheet";
 import { deriveWorkspaceArtifacts } from "../workspaceArtifacts";
 import { COWORK_SHELL } from "../coworkShell";
 import { formatWorkspaceRelativePath, resolveWorkspaceSelectionPath } from "../filePathDisplay";
-import { Sidebar, SidebarProvider, SidebarRail, SidebarTrigger, useSidebar } from "./ui/sidebar";
+import {
+  Sidebar,
+  SidebarProvider,
+  SidebarRail,
+  SidebarTrigger,
+  useOptionalSidebar,
+} from "./ui/sidebar";
 
 const IMAGE_ONLY_BOOTSTRAP_PROMPT =
   "[User attached one or more images without additional text. Respond using the conversation context and the attached image(s).]";
@@ -685,7 +691,7 @@ export default function ChatView(props: ChatViewProps) {
   >({});
   const [pendingUserInputQuestionIndexByRequestId, setPendingUserInputQuestionIndexByRequestId] =
     useState<Record<string, number>>({});
-  const { state: leftSidebarState } = useSidebar();
+  const leftSidebarState = useOptionalSidebar()?.state ?? "expanded";
   const isLeftSidebarCollapsed = leftSidebarState === "collapsed";
   const [planSidebarOpen, setPlanSidebarOpen] = useState(false);
   // When true, the console rail widens to a roomier reading width. We keep
@@ -1937,15 +1943,15 @@ export default function ChatView(props: ChatViewProps) {
 
       const targetPath =
         resolveWorkspaceSelectionPath(input.path, activeWorkspaceRoot) ?? input.path;
-      const targetUrl = new URL(
-        buildViewerWindowPath(
+      const targetUrl = buildViewerWindowUrl({
+        baseUrl: window.location.href,
+        target:
           routeKind === "draft" && draftId
             ? { routeKind: "draft", draftId }
             : { routeKind: "server", environmentId, threadId },
-          { path: targetPath, mode: input.mode },
-        ),
-        window.location.origin,
-      ).toString();
+        search: { path: targetPath, mode: input.mode },
+        useHashRouting: isElectron,
+      });
 
       void localApi.shell.openAppWindow(targetUrl).catch((error) => {
         toastManager.add({
