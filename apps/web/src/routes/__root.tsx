@@ -72,6 +72,7 @@ export const Route = createRootRouteWithContext<{
 function RootRouteView() {
   const pathname = useLocation({ select: (location) => location.pathname });
   const { authGateState } = Route.useRouteContext();
+  const isViewerWindowRoute = pathname.startsWith("/_viewer/");
 
   useEffect(() => {
     const frame = window.requestAnimationFrame(() => {
@@ -100,9 +101,13 @@ function RootRouteView() {
         <SlowRpcAckToastCoordinator />
         <WebSocketConnectionSurface>
           <CommandPalette>
-            <AppSidebarLayout>
+            {isViewerWindowRoute ? (
               <Outlet />
-            </AppSidebarLayout>
+            ) : (
+              <AppSidebarLayout>
+                <Outlet />
+              </AppSidebarLayout>
+            )}
           </CommandPalette>
         </WebSocketConnectionSurface>
       </AnchoredToastProvider>

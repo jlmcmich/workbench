@@ -22,14 +22,20 @@ const {
   readEnvironmentApiMock: vi.fn((environmentId: string) => environmentApiById.get(environmentId)),
   readLocalApiMock: vi.fn<
     () =>
-      | {
+        | {
           contextMenu: { show: ReturnType<typeof vi.fn> };
-          shell: { openExternal: ReturnType<typeof vi.fn> };
+          shell: {
+            openExternal: ReturnType<typeof vi.fn>;
+            openAppWindow: ReturnType<typeof vi.fn>;
+          };
         }
       | undefined
   >(() => ({
     contextMenu: { show: vi.fn(async () => null) },
-    shell: { openExternal: vi.fn(async () => undefined) },
+    shell: {
+      openExternal: vi.fn(async () => undefined),
+      openAppWindow: vi.fn(async () => undefined),
+    },
   })),
 }));
 

@@ -83,6 +83,7 @@ function createTestClient() {
     },
     shell: {
       openInEditor: vi.fn(async () => undefined),
+      openAppWindow: vi.fn(async () => undefined),
     },
     git: {
       pull: vi.fn(async () => undefined),

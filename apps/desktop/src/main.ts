@@ -83,6 +83,7 @@ const CONFIRM_CHANNEL = "desktop:confirm";
 const SET_THEME_CHANNEL = "desktop:set-theme";
 const CONTEXT_MENU_CHANNEL = "desktop:context-menu";
 const OPEN_EXTERNAL_CHANNEL = "desktop:open-external";
+const OPEN_APP_WINDOW_CHANNEL = "desktop:open-app-window";
 const MENU_ACTION_CHANNEL = "desktop:menu-action";
 const UPDATE_STATE_CHANNEL = "desktop:update-state";
 const UPDATE_GET_STATE_CHANNEL = "desktop:update-get-state";
@@ -444,6 +445,37 @@ function getSafeExternalUrl(rawUrl: unknown): string | null {
   }
 
   return parsedUrl.toString();
+}
+
+function getSafeAppWindowUrl(rawUrl: unknown): string | null {
+  if (typeof rawUrl !== "string" || rawUrl.length === 0) {
+    return null;
+  }
+
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(rawUrl);
+  } catch {
+    return null;
+  }
+
+  if (!parsedUrl.pathname.startsWith("/_viewer/")) {
+    return null;
+  }
+
+  const expectedOriginSource = isDevelopment ? resolveDesktopDevServerUrl() : backendHttpUrl;
+  if (!expectedOriginSource) {
+    return null;
+  }
+
+  let expectedOrigin: string;
+  try {
+    expectedOrigin = new URL(expectedOriginSource).origin;
+  } catch {
+    return null;
+  }
+
+  return parsedUrl.origin === expectedOrigin ? parsedUrl.toString() : null;
 }
 
 function getSafeTheme(rawTheme: unknown): DesktopTheme | null {
@@ -1832,6 +1864,24 @@ function registerIpcHandlers(): void {
     }
   });
 
+  ipcMain.removeHandler(OPEN_APP_WINDOW_CHANNEL);
+  ipcMain.handle(OPEN_APP_WINDOW_CHANNEL, async (_event, rawUrl: unknown) => {
+    const appWindowUrl = getSafeAppWindowUrl(rawUrl);
+    if (!appWindowUrl) {
+      return false;
+    }
+
+    createWindow({
+      initialUrl: appWindowUrl,
+      width: 1040,
+      height: 780,
+      minWidth: 760,
+      minHeight: 540,
+      openDevTools: false,
+    });
+    return true;
+  });
+
   ipcMain.removeHandler(UPDATE_GET_STATE_CHANNEL);
   ipcMain.handle(UPDATE_GET_STATE_CHANNEL, async () => updateState);
 
@@ -1966,12 +2016,19 @@ function syncAllWindowAppearance(): void {
 
 nativeTheme.on("updated", syncAllWindowAppearance);
 
-function createWindow(): BrowserWindow {
+function createWindow(options?: {
+  initialUrl?: string;
+  width?: number;
+  height?: number;
+  minWidth?: number;
+  minHeight?: number;
+  openDevTools?: boolean;
+}): BrowserWindow {
   const window = new BrowserWindow({
-    width: 1100,
-    height: 780,
-    minWidth: 840,
-    minHeight: 620,
+    width: options?.width ?? 1100,
+    height: options?.height ?? 780,
+    minWidth: options?.minWidth ?? 840,
+    minHeight: options?.minHeight ?? 620,
     show: false,
     autoHideMenuBar: true,
     backgroundColor: getInitialWindowBackgroundColor(),
@@ -2058,11 +2115,11 @@ function createWindow(): BrowserWindow {
 
   window.once("ready-to-show", revealInitialWindow);
 
-  if (isDevelopment) {
-    void window.loadURL(resolveDesktopDevServerUrl());
+  const initialUrl =
+    options?.initialUrl ?? (isDevelopment ? resolveDesktopDevServerUrl() : backendHttpUrl);
+  void window.loadURL(initialUrl);
+  if (isDevelopment && options?.openDevTools !== false) {
     window.webContents.openDevTools({ mode: "detach" });
-  } else {
-    void window.loadURL(backendHttpUrl);
   }
 
   window.on("closed", () => {

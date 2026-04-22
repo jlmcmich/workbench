@@ -32,7 +32,7 @@ import {
   normalizePlanMarkdownForExport,
 } from "../../proposedPlan";
 import { readEnvironmentApi } from "~/environmentApi";
-import type { ActivePlanState, LatestProposedPlanState, WorkLogEntry } from "../../session-logic";
+import type { ActivePlanState, LatestProposedPlanState } from "../../session-logic";
 import type { TurnDiffSummary } from "../../types";
 import {
   describeWorkspaceArtifact,
@@ -151,14 +151,19 @@ interface ConsoleRailProps {
   resolvedTheme: "light" | "dark";
   timestampFormat: TimestampFormat;
   artifacts: ReadonlyArray<WorkspaceArtifact>;
-  workEntries: ReadonlyArray<WorkLogEntry>;
   activePlan: ActivePlanState | null;
   activeProposedPlan: LatestProposedPlanState | null;
   turnDiffSummaries: ReadonlyArray<TurnDiffSummary>;
   inferredCheckpointTurnCountByTurnId: Readonly<Record<string, number>>;
   focusedPath?: string | null;
   expanded?: boolean;
+  viewerOnly?: boolean;
+  initialDocumentViewMode?: ViewerDocumentMode;
+  onPopOutViewer?:
+    | ((input: { path: string; mode: ViewerDocumentMode; hasUnsavedEdits: boolean }) => void)
+    | undefined;
   onToggleExpanded?: () => void;
+  onViewerOverlayOpenChange?: (open: boolean) => void;
   onClose: () => void;
   onOpenTurnDiff?: (turnId: TurnId, filePath?: string) => void;
   onAddTextToChat?: (input: { path: string; text: string }) => void;
@@ -174,14 +179,17 @@ const ConsoleRail = memo(function ConsoleRail({
   resolvedTheme,
   timestampFormat,
   artifacts,
-  workEntries,
   activePlan,
   activeProposedPlan,
   turnDiffSummaries,
   inferredCheckpointTurnCountByTurnId,
   focusedPath,
   expanded = false,
+  viewerOnly = false,
+  initialDocumentViewMode = "preview",
+  onPopOutViewer,
   onToggleExpanded,
+  onViewerOverlayOpenChange,
   onClose,
   onOpenTurnDiff,
   onAddTextToChat,
@@ -192,7 +200,8 @@ const ConsoleRail = memo(function ConsoleRail({
 
   // ----- shared cross-pane state -----
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
-  const [documentViewMode, setDocumentViewMode] = useState<ViewerDocumentMode>("preview");
+  const [documentViewMode, setDocumentViewMode] =
+    useState<ViewerDocumentMode>(initialDocumentViewMode);
   const [expandedDirectories, setExpandedDirectories] = useState<Set<string>>(new Set());
   const [isSavingPlanToWorkspace, setIsSavingPlanToWorkspace] = useState(false);
   const [selectedDocumentText, setSelectedDocumentText] = useState("");
@@ -278,9 +287,9 @@ const ConsoleRail = memo(function ConsoleRail({
       return;
     }
     setSelectedPath(focusedPath);
-    setDocumentViewMode("preview");
+    setDocumentViewMode(initialDocumentViewMode);
     setViewerOverlayOpen(true);
-  }, [focusedPath]);
+  }, [focusedPath, initialDocumentViewMode]);
 
   // Auto-expand all ancestors of the selection so the tree can scroll to it.
   useEffect(() => {
@@ -382,7 +391,10 @@ const ConsoleRail = memo(function ConsoleRail({
       relativePath: selectedPath
         ? resolveWorkspaceSelectionPath(selectedPath, workspaceRoot)
         : null,
-      enabled: viewerOverlayOpen && !!workspaceRoot && selectedDescriptor?.previewKind === "text",
+      enabled:
+        (viewerOverlayOpen || viewerOnly) &&
+        !!workspaceRoot &&
+        selectedDescriptor?.previewKind === "text",
       maxBytes: 24_000,
     }),
   );
@@ -590,13 +602,28 @@ const ConsoleRail = memo(function ConsoleRail({
   }, []);
 
   const closeViewerOverlay = useCallback(() => {
+    if (viewerOnly) {
+      onClose();
+      return;
+    }
     setViewerOverlayOpen(false);
-    // Expand is a viewer-scoped affordance — when the user closes the viewer
-    // we collapse the rail back so the chat column reappears in one move.
+    // Widen is a viewer-scoped affordance — when the user closes the viewer
+    // we return the rail to its normal width in one move.
     if (expanded && onToggleExpanded) {
       onToggleExpanded();
     }
-  }, [expanded, onToggleExpanded]);
+  }, [expanded, onClose, onToggleExpanded, viewerOnly]);
+
+  const popOutViewer = useCallback(() => {
+    if (!selectedPath || !onPopOutViewer) {
+      return;
+    }
+    onPopOutViewer({
+      path: selectedPath,
+      mode: documentViewMode,
+      hasUnsavedEdits: documentViewMode === "edit",
+    });
+  }, [documentViewMode, onPopOutViewer, selectedPath]);
 
   // ----- diff entry-points for tree pane -----
   const firstDiffCapableArtifact = useMemo(
@@ -628,13 +655,45 @@ const ConsoleRail = memo(function ConsoleRail({
       ? `${artifacts.length} changed files`
       : "Browse the project and review outputs";
 
-  const showViewerOverlay = viewerOverlayOpen && !!selectedPath;
+  const showViewerOverlay = (viewerOnly || viewerOverlayOpen) && !!selectedPath;
+
+  useEffect(() => {
+    onViewerOverlayOpenChange?.(showViewerOverlay);
+  }, [onViewerOverlayOpenChange, showViewerOverlay]);
 
   return (
     <div
       data-panel-mode={mode}
       className="relative flex h-full min-h-0 min-w-0 w-full flex-col overflow-hidden bg-card/55 [-webkit-app-region:no-drag]"
     >
+      {viewerOnly ? (
+        <ViewerPane
+          workspaceRoot={workspaceRoot}
+          markdownCwd={markdownCwd}
+          resolvedTheme={resolvedTheme}
+          timestampFormat={timestampFormat}
+          selectedPath={selectedPath}
+          selectedArtifact={selectedArtifact}
+          documentViewMode={documentViewMode}
+          documentText={textFileQuery.data?.contents ?? null}
+          documentTextTruncated={textFileQuery.data?.truncated ?? false}
+          documentTextLoading={textFileQuery.isLoading}
+          patchPreview={textFileQuery.isError ? selectedPatchPreview : null}
+          selectedDocumentTextSelection={selectedDocumentText}
+          onSetDocumentViewMode={setDocumentViewMode}
+          onRefresh={refreshWorkspace}
+          onOpenInApp={openArtifactInNativeApp}
+          onOpenInEditor={openArtifactInEditor}
+          onPopOut={undefined}
+          onSyncSelection={syncSelectedDocumentText}
+          onClearSelection={() => setSelectedDocumentText("")}
+          onOpenWorkspaceFileLink={openWorkspaceFileFromLink}
+          onOpenTurnDiff={onOpenTurnDiff}
+          onSaveFile={saveWorkspaceFile}
+          onClosePane={closeViewerOverlay}
+        />
+      ) : (
+        <>
       <RailHeader
         summary={headerSummary}
         panes={panes}
@@ -697,7 +756,6 @@ const ConsoleRail = memo(function ConsoleRail({
                       timestampFormat={timestampFormat}
                       activePlan={activePlan}
                       activeProposedPlan={activeProposedPlan}
-                      workEntries={workEntries}
                       isSavingPlanToWorkspace={isSavingPlanToWorkspace}
                       isPlanCopied={isCopied}
                       onCopyPlan={(markdown) => copyToClipboard(markdown)}
@@ -734,9 +792,10 @@ const ConsoleRail = memo(function ConsoleRail({
             onRefresh={refreshWorkspace}
             onOpenInApp={openArtifactInNativeApp}
             onOpenInEditor={openArtifactInEditor}
+            onPopOut={onPopOutViewer ? popOutViewer : undefined}
             onSyncSelection={syncSelectedDocumentText}
             onClearSelection={() => setSelectedDocumentText("")}
-            onAddSelectionToChat={addSelectedTextToChat}
+            onAddSelectionToChat={onAddTextToChat ? addSelectedTextToChat : undefined}
             onOpenWorkspaceFileLink={openWorkspaceFileFromLink}
             onOpenTurnDiff={onOpenTurnDiff}
             expanded={expanded}
@@ -746,6 +805,8 @@ const ConsoleRail = memo(function ConsoleRail({
           />
         </div>
       ) : null}
+        </>
+      )}
     </div>
   );
 });

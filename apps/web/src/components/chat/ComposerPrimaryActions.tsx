@@ -1,5 +1,5 @@
 import { memo } from "react";
-import { ChevronDownIcon, ChevronLeftIcon } from "lucide-react";
+import { ChevronDownIcon, ChevronLeftIcon, PlusIcon } from "lucide-react";
 import { cn } from "~/lib/utils";
 import { Button } from "../ui/button";
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../ui/menu";
@@ -22,8 +22,16 @@ interface ComposerPrimaryActionsProps {
   isConnecting: boolean;
   isPreparingWorktree: boolean;
   hasSendableContent: boolean;
+  /**
+   * True when the current provider supports queueing messages against an
+   * in-flight turn (today: pi). Gates the queue menu we render alongside
+   * the stop button while a turn is running.
+   */
+  canQueue: boolean;
   onPreviousPendingQuestion: () => void;
   onInterrupt: () => void;
+  /** Dispatch a queued prompt as a steer (nudge) or follow-up. */
+  onQueue: (kind: "steer" | "followUp") => void;
   onImplementPlanInNewThread: () => void;
 }
 
@@ -55,8 +63,10 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
   isConnecting,
   isPreparingWorktree,
   hasSendableContent,
+  canQueue,
   onPreviousPendingQuestion,
   onInterrupt,
+  onQueue,
   onImplementPlanInNewThread,
 }: ComposerPrimaryActionsProps) {
   if (pendingAction) {
@@ -107,7 +117,8 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
   }
 
   if (isRunning) {
-    return (
+    const showQueueMenu = canQueue && promptHasText;
+    const stopButton = (
       <button
         type="button"
         className="flex size-8 cursor-pointer items-center justify-center rounded-full bg-rose-500/90 text-white transition-all duration-150 hover:bg-rose-500 hover:scale-105 sm:h-8 sm:w-8"
@@ -118,6 +129,35 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
           <rect x="2" y="2" width="8" height="8" rx="1.5" />
         </svg>
       </button>
+    );
+    if (!showQueueMenu) return stopButton;
+    return (
+      <div className="flex items-center gap-1.5">
+        <Menu>
+          <MenuTrigger
+            render={
+              <Button
+                size="icon-sm"
+                variant="outline"
+                className="rounded-full"
+                aria-label="Queue message"
+                type="button"
+              />
+            }
+          >
+            <PlusIcon className="size-3.5" />
+          </MenuTrigger>
+          <MenuPopup align="end" side="top">
+            <MenuItem onClick={() => onQueue("steer")}>
+              Steer current turn
+            </MenuItem>
+            <MenuItem onClick={() => onQueue("followUp")}>
+              Queue as follow-up
+            </MenuItem>
+          </MenuPopup>
+        </Menu>
+        {stopButton}
+      </div>
     );
   }
 

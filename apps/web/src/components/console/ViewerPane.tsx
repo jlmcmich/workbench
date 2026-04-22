@@ -130,9 +130,10 @@ interface ViewerPaneProps {
   onRefresh: () => void;
   onOpenInApp: (path: string) => void;
   onOpenInEditor: (path: string) => void;
+  onPopOut?: (() => void) | undefined;
   onSyncSelection: () => void;
   onClearSelection: () => void;
-  onAddSelectionToChat: () => void;
+  onAddSelectionToChat?: (() => void) | undefined;
   onOpenWorkspaceFileLink: (path: string) => boolean;
   onOpenTurnDiff: ((turnId: TurnId, filePath?: string) => void) | undefined;
   onClosePane: () => void;
@@ -169,6 +170,7 @@ export function ViewerPane({
   onRefresh,
   onOpenInApp,
   onOpenInEditor,
+  onPopOut,
   onSyncSelection,
   onAddSelectionToChat,
   onOpenWorkspaceFileLink,
@@ -387,13 +389,25 @@ export function ViewerPane({
           >
             <RefreshCwIcon className="size-3.5" />
           </Button>
+          {onPopOut ? (
+            <Button
+              size="icon-xs"
+              variant="ghost"
+              onClick={onPopOut}
+              aria-label="Pop out viewer"
+              title="Open this document in a separate window"
+              className="text-muted-foreground/60 hover:text-foreground/80"
+            >
+              <ExternalLinkIcon className="size-3.5" />
+            </Button>
+          ) : null}
           {onToggleExpanded ? (
             <Button
               size="icon-xs"
               variant="ghost"
               onClick={onToggleExpanded}
-              aria-label={expanded ? "Shrink viewer" : "Expand viewer"}
-              title={expanded ? "Shrink viewer" : "Expand viewer to cover the chat column"}
+              aria-label={expanded ? "Shrink viewer" : "Widen viewer"}
+              title={expanded ? "Shrink viewer" : "Widen viewer for easier reading"}
               className="text-muted-foreground/60 hover:text-foreground/80"
             >
               {expanded ? (
@@ -443,7 +457,7 @@ export function ViewerPane({
         </div>
         {selectedPath ? (
           <div className="flex shrink-0 items-center gap-1.5">
-            {selectedDocumentTextSelection ? (
+            {selectedDocumentTextSelection && onAddSelectionToChat ? (
               <Button size="xs" variant="secondary" onClick={onAddSelectionToChat}>
                 Add to chat
               </Button>

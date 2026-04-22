@@ -108,7 +108,6 @@ function defaultProps(overrides?: Partial<RailProps>): RailProps {
     resolvedTheme: "dark",
     timestampFormat: "locale",
     artifacts: [],
-    workEntries: [],
     activePlan: null,
     activeProposedPlan: null,
     turnDiffSummaries: [],
@@ -545,6 +544,49 @@ describe("ConsoleRail viewer (Phase 2)", () => {
       expect(document.querySelector(".document-markdown")).toBeNull();
       expect(document.body.textContent ?? "").toContain("# Hello");
       expect(document.body.textContent ?? "").toContain("Document content.");
+    });
+  });
+
+  it("shows a pop-out action and calls the provided callback with the active file + mode", async () => {
+    mockReadFileResponse = {
+      contents: "# Hello\n\nDocument content.",
+      relativePath: "some/file.md",
+      truncated: false,
+    };
+    const onPopOutViewer = vi.fn();
+    await using _ = await mountRail({
+      workspaceRoot: "/Users/jlm/proj",
+      focusedPath: "/Users/jlm/proj/some/file.md",
+      onPopOutViewer,
+    });
+
+    await page.getByLabelText("Pop out viewer").click();
+
+    await vi.waitFor(() => {
+      expect(onPopOutViewer).toHaveBeenCalledWith({
+        path: "/Users/jlm/proj/some/file.md",
+        mode: "preview",
+        hasUnsavedEdits: false,
+      });
+    });
+  });
+
+  it("viewerOnly mode renders the document without the rail header chrome", async () => {
+    mockReadFileResponse = {
+      contents: "# Hello\n\nDocument content.",
+      relativePath: "some/file.md",
+      truncated: false,
+    };
+    await using _ = await mountRail({
+      workspaceRoot: "/Users/jlm/proj",
+      focusedPath: "/Users/jlm/proj/some/file.md",
+      viewerOnly: true,
+    });
+
+    await vi.waitFor(() => {
+      expect(document.body.textContent ?? "").toContain("Document content.");
+      expect(document.querySelector('[aria-label="Add or remove console panes"]')).toBeNull();
+      expect(viewerOverlayCount()).toBe(0);
     });
   });
 });

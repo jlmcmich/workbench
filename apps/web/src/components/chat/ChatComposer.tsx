@@ -285,8 +285,10 @@ const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryActions(
   isSendBusy: boolean;
   isConnecting: boolean;
   hasSendableContent: boolean;
+  canQueue: boolean;
   onPreviousPendingQuestion: () => void;
   onInterrupt: () => void;
+  onQueue: (kind: "steer" | "followUp") => void;
   onImplementPlanInNewThread: () => void;
 }) {
   return (
@@ -305,8 +307,10 @@ const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryActions(
         isConnecting={props.isConnecting}
         isPreparingWorktree={props.isPreparingWorktree}
         hasSendableContent={props.hasSendableContent}
+        canQueue={props.canQueue}
         onPreviousPendingQuestion={props.onPreviousPendingQuestion}
         onInterrupt={props.onInterrupt}
+        onQueue={props.onQueue}
         onImplementPlanInNewThread={props.onImplementPlanInNewThread}
       />
     </>
@@ -428,6 +432,14 @@ export interface ChatComposerProps {
   // Callbacks
   onSend: (e?: { preventDefault: () => void }) => void;
   onInterrupt: () => void;
+  /**
+   * Dispatch a prompt queued against the in-flight turn. `kind: "steer"`
+   * nudges the current turn; `"followUp"` runs after it settles. Only
+   * called when the active provider supports queueing (today: pi).
+   */
+  onQueue: (kind: "steer" | "followUp") => void;
+  /** True when the active provider supports queued messages. */
+  canQueue: boolean;
   onImplementPlanInNewThread: () => void;
   onRespondToApproval: (
     requestId: ApprovalRequestId,
@@ -510,6 +522,8 @@ export const ChatComposer = memo(
       scheduleStickToBottom,
       onSend,
       onInterrupt,
+      onQueue,
+      canQueue,
       onImplementPlanInNewThread,
       onRespondToApproval,
       onSelectActivePendingUserInputOption,
@@ -2041,8 +2055,10 @@ export const ChatComposer = memo(
                     isConnecting={isConnecting}
                     isPreparingWorktree={isPreparingWorktree}
                     hasSendableContent={composerSendState.hasSendableContent}
+                    canQueue={canQueue}
                     onPreviousPendingQuestion={onPreviousActivePendingUserInputQuestion}
                     onInterrupt={handleInterruptPrimaryAction}
+                    onQueue={onQueue}
                     onImplementPlanInNewThread={handleImplementPlanInNewThreadPrimaryAction}
                   />
                 </div>
