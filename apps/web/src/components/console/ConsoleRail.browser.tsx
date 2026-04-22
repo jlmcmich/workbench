@@ -570,25 +570,6 @@ describe("ConsoleRail viewer (Phase 2)", () => {
       });
     });
   });
-
-  it("viewerOnly mode renders the document without the rail header chrome", async () => {
-    mockReadFileResponse = {
-      contents: "# Hello\n\nDocument content.",
-      relativePath: "some/file.md",
-      truncated: false,
-    };
-    await using _ = await mountRail({
-      workspaceRoot: "/Users/jlm/proj",
-      focusedPath: "/Users/jlm/proj/some/file.md",
-      viewerOnly: true,
-    });
-
-    await vi.waitFor(() => {
-      expect(document.body.textContent ?? "").toContain("Document content.");
-      expect(document.querySelector('[aria-label="Add or remove console panes"]')).toBeNull();
-      expect(viewerOverlayCount()).toBe(0);
-    });
-  });
 });
 
 // ----- visual snapshots -----

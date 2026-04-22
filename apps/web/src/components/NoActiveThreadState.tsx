@@ -67,7 +67,7 @@ import {
   MenuSeparator,
   MenuTrigger,
 } from "./ui/menu";
-import { SidebarInset, SidebarTrigger, useSidebar } from "./ui/sidebar";
+import { SidebarInset, SidebarTrigger, useOptionalSidebar } from "./ui/sidebar";
 import { Textarea } from "./ui/textarea";
 
 type AnyProviderOptions = ProviderModelOptions[ProviderKind];
@@ -178,7 +178,8 @@ export function NoActiveThreadState() {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const providers = useServerProviders();
   const { handleNewThread } = useNewThreadHandler();
-  const { state: leftSidebarState } = useSidebar();
+  const sidebar = useOptionalSidebar();
+  const leftSidebarState = sidebar?.state ?? "expanded";
   const isLeftSidebarCollapsed = leftSidebarState === "collapsed";
   const settings = useSettings((settings) => settings);
   const projectOrder = useUiStateStore((store) => store.projectOrder);
@@ -550,7 +551,7 @@ export function NoActiveThreadState() {
               : "py-2 sm:py-3",
           )}
         >
-          {isLeftSidebarCollapsed ? (
+          {isLeftSidebarCollapsed && sidebar ? (
             <SidebarTrigger className="mr-2 size-7 shrink-0 text-muted-foreground/70 hover:text-foreground" />
           ) : null}
           {isElectron ? (

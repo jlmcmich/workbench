@@ -44,6 +44,25 @@ export function buildViewerWindowPath(
   return query.length > 0 ? `${pathname}?${query}` : pathname;
 }
 
+export function buildViewerWindowUrl(options: {
+  baseUrl: string;
+  target: ViewerWindowRouteTarget;
+  search: ViewerWindowRouteSearch;
+  useHashRouting?: boolean;
+}): string {
+  const routePath = buildViewerWindowPath(options.target, options.search);
+  const base = new URL(options.baseUrl);
+
+  if (options.useHashRouting) {
+    base.pathname = "/";
+    base.search = "";
+    base.hash = routePath;
+    return base.toString();
+  }
+
+  return new URL(routePath, base.origin).toString();
+}
+
 function normalizeSearchString(value: unknown): string | undefined {
   if (typeof value !== "string") {
     return undefined;

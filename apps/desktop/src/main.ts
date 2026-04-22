@@ -209,6 +209,7 @@ type WindowTitleBarOptions = Pick<
 >;
 
 type DesktopUpdateErrorContext = DesktopUpdateState["errorContext"];
+type DesktopWindowKind = "main" | "viewer";
 type LinuxDesktopNamedApp = Electron.App & {
   setDesktopName?: (desktopName: string) => void;
 };
@@ -236,6 +237,7 @@ let restoreStdIoCapture: (() => void) | null = null;
 let backendObservabilitySettings = readPersistedBackendObservabilitySettings();
 let desktopSettings = readDesktopSettings(DESKTOP_SETTINGS_PATH, app.getVersion());
 let desktopServerExposureMode: DesktopServerExposureMode = desktopSettings.serverExposureMode;
+const windowKindById = new Map<number, DesktopWindowKind>();
 
 let destructiveMenuIconCache: Electron.NativeImage | null | undefined;
 const expectedBackendExitChildren = new WeakSet<ChildProcess.ChildProcess>();
@@ -459,7 +461,8 @@ function getSafeAppWindowUrl(rawUrl: unknown): string | null {
     return null;
   }
 
-  if (!parsedUrl.pathname.startsWith("/viewer/")) {
+  const viewerRoute = resolveViewerRoute(parsedUrl);
+  if (!viewerRoute || !viewerRoute.pathname.startsWith("/viewer/")) {
     return null;
   }
 
@@ -476,6 +479,55 @@ function getSafeAppWindowUrl(rawUrl: unknown): string | null {
   }
 
   return parsedUrl.origin === expectedOrigin ? parsedUrl.toString() : null;
+}
+
+function resolveViewerWindowTitle(url: string): string {
+  try {
+    const parsedUrl = new URL(url);
+    const rawPath = resolveViewerRoute(parsedUrl)?.searchParams.get("path")?.trim() ?? "";
+    const trimmedPath = rawPath.replace(/[\\/]+$/, "");
+    const filename = trimmedPath.length > 0 ? Path.basename(trimmedPath) : "";
+    return filename.length > 0 ? filename : "Document";
+  } catch {
+    return "Document";
+  }
+}
+
+function resolveViewerRoute(
+  parsedUrl: URL,
+): { pathname: string; searchParams: URLSearchParams } | null {
+  if (parsedUrl.pathname.startsWith("/viewer/")) {
+    return {
+      pathname: parsedUrl.pathname,
+      searchParams: parsedUrl.searchParams,
+    };
+  }
+
+  const normalizedHash = parsedUrl.hash.startsWith("#") ? parsedUrl.hash.slice(1) : parsedUrl.hash;
+  if (!normalizedHash.startsWith("/viewer/")) {
+    return null;
+  }
+
+  try {
+    const hashUrl = new URL(normalizedHash, "http://viewer.local");
+    return {
+      pathname: hashUrl.pathname,
+      searchParams: hashUrl.searchParams,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function titleForWindow(options: { kind: DesktopWindowKind; title: string | undefined }): string {
+  return options.title ?? (options.kind === "viewer" ? "Document" : APP_DISPLAY_NAME);
+}
+
+function titleBarOptionsForWindow(kind: DesktopWindowKind): WindowTitleBarOptions | undefined {
+  if (kind === "viewer") {
+    return undefined;
+  }
+  return getWindowTitleBarOptions();
 }
 
 function getSafeTheme(rawTheme: unknown): DesktopTheme | null {
@@ -1871,12 +1923,16 @@ function registerIpcHandlers(): void {
       return false;
     }
 
+    const owner = BrowserWindow.getFocusedWindow() ?? mainWindow ?? null;
     createWindow({
+      kind: "viewer",
       initialUrl: appWindowUrl,
-      width: 1040,
-      height: 780,
-      minWidth: 760,
-      minHeight: 540,
+      parent: owner,
+      title: resolveViewerWindowTitle(appWindowUrl),
+      width: 980,
+      height: 760,
+      minWidth: 720,
+      minHeight: 520,
       openDevTools: false,
     });
     return true;
@@ -2002,7 +2058,9 @@ function syncWindowAppearance(window: BrowserWindow): void {
   }
 
   window.setBackgroundColor(getInitialWindowBackgroundColor());
-  const { titleBarOverlay } = getWindowTitleBarOptions();
+  const windowKind = windowKindById.get(window.id) ?? "main";
+  const titleBarOptions = titleBarOptionsForWindow(windowKind);
+  const { titleBarOverlay } = titleBarOptions ?? {};
   if (typeof titleBarOverlay === "object") {
     window.setTitleBarOverlay(titleBarOverlay);
   }
@@ -2017,24 +2075,34 @@ function syncAllWindowAppearance(): void {
 nativeTheme.on("updated", syncAllWindowAppearance);
 
 function createWindow(options?: {
+  kind?: DesktopWindowKind;
   initialUrl?: string;
+  parent?: BrowserWindow | null;
+  title?: string;
   width?: number;
   height?: number;
   minWidth?: number;
   minHeight?: number;
   openDevTools?: boolean;
 }): BrowserWindow {
+  const windowKind = options?.kind ?? "main";
+  const titleBarOptions = titleBarOptionsForWindow(windowKind);
+  const windowTitle = titleForWindow({
+    kind: windowKind,
+    title: options?.title,
+  });
   const window = new BrowserWindow({
     width: options?.width ?? 1100,
     height: options?.height ?? 780,
     minWidth: options?.minWidth ?? 840,
     minHeight: options?.minHeight ?? 620,
+    ...(options?.parent ? { parent: options.parent } : {}),
     show: false,
     autoHideMenuBar: true,
     backgroundColor: getInitialWindowBackgroundColor(),
     ...getIconOption(),
-    title: APP_DISPLAY_NAME,
-    ...getWindowTitleBarOptions(),
+    title: windowTitle,
+    ...(titleBarOptions ?? {}),
     webPreferences: {
       preload: Path.join(__dirname, "preload.cjs"),
       contextIsolation: true,
@@ -2042,6 +2110,7 @@ function createWindow(options?: {
       sandbox: true,
     },
   });
+  windowKindById.set(window.id, windowKind);
 
   window.webContents.on("context-menu", (event, params) => {
     event.preventDefault();
@@ -2097,10 +2166,10 @@ function createWindow(options?: {
 
   window.on("page-title-updated", (event) => {
     event.preventDefault();
-    window.setTitle(APP_DISPLAY_NAME);
+    window.setTitle(windowTitle);
   });
   window.webContents.on("did-finish-load", () => {
-    window.setTitle(APP_DISPLAY_NAME);
+    window.setTitle(windowTitle);
     emitUpdateState();
   });
 
@@ -2123,6 +2192,7 @@ function createWindow(options?: {
   }
 
   window.on("closed", () => {
+    windowKindById.delete(window.id);
     if (mainWindow === window) {
       mainWindow = null;
     }

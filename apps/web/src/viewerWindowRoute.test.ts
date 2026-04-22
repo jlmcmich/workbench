@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { buildViewerWindowPath, parseViewerWindowRouteSearch } from "./viewerWindowRoute";
+import {
+  buildViewerWindowPath,
+  buildViewerWindowUrl,
+  parseViewerWindowRouteSearch,
+} from "./viewerWindowRoute";
 
 describe("viewerWindowRoute", () => {
   it("parses the viewer search params with preview as the default mode", () => {
@@ -46,5 +50,41 @@ describe("viewerWindowRoute", () => {
         },
       ),
     ).toBe("/viewer/draft/draft-123?path=docs%2Fspec.md");
+  });
+
+  it("builds a browser viewer window url", () => {
+    expect(
+      buildViewerWindowUrl({
+        baseUrl: "http://127.0.0.1:5733/",
+        target: {
+          routeKind: "server",
+          environmentId: "environment-local",
+          threadId: "thread-123",
+        },
+        search: {
+          path: "docs/spec.md",
+          mode: "edit",
+        },
+      }),
+    ).toBe(
+      "http://127.0.0.1:5733/viewer/environment-local/thread-123?path=docs%2Fspec.md&mode=edit",
+    );
+  });
+
+  it("builds a hash-routed viewer window url for electron", () => {
+    expect(
+      buildViewerWindowUrl({
+        baseUrl: "http://127.0.0.1:5733/#/",
+        target: {
+          routeKind: "draft",
+          draftId: "draft-123",
+        },
+        search: {
+          path: "docs/spec.md",
+          mode: "preview",
+        },
+        useHashRouting: true,
+      }),
+    ).toBe("http://127.0.0.1:5733/#/viewer/draft/draft-123?path=docs%2Fspec.md");
   });
 });
